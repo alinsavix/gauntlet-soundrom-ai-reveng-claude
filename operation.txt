@@ -1,0 +1,32 @@
+The Gauntlet arcade game's architecture uses a 68010 processor to run the bulk of the game, with a 6502 coprocessor handling sound duties. The sound coprocessor is what we will be focussing on.
+
+The sound subsystem is made up of the following components:
+- An 8-bit 6502 microprocessor
+- RAM mapped between 0x0000 and 0x0fff
+- Program ROM, mapped between 0x4000 and 0xffff
+- Various hardware connections, mapped between 0x1000 and 0x1035
+- A YM2151 sound chip for music, mapped between 0x1810 and 0x1811
+- A custom POKEY chip four sound effects (sfx), mapped between 0x1800 and 0x180f
+- A TMS5220 speech synthesis chip, mapped at 0x1830
+
+The 6502 runs a program stored in the ROM, which is responsible for playing music, sound effects, and speech. The main CPU (68010) communicates with the sound CPU (6502) by writing commands to a specific memory location, which the sound CPU then reads and processes. The sound coprocessor keeps a small buffer of sound commands to be executed.
+
+The sound coprocessor reads commands from address 0x1010, and writes some information back to the main CPU using address 0x1000.
+
+Address 0x1020 has multiple purposes, with a distinction made between reading and writing from that address. When writing to 0x1020, the value written is used to control the volume ("mix") of the three main parts of the sound system. Bits D5 to D7 are used to control speech volume, bits D3-D4 control the effects volume, and bits D0-D2 control the music volume.
+
+Reading from 0x1020 returns information about when a coin was inserted, with coin slots 1 to 4 represented by bits D3 to D0 respectively.
+
+Address 0x1030 also behaves differently between reading and writing. When being read, bit D7 being high indicates that there is data available at 0x1010. Bit D6 is an "output buffer full" flag for address 0x1000. D5 is a "speech ready" flag (active low), and D4 is a "self test" signal (also active low).
+
+When written, 0x1030 bit D7 will control music reset (active low). 0x1031 bit D7 is a "speech write" signal (active low). 0x1032 bit D7 is a "speech reset" signal (active low). 0x1033 bit D7 is a "speech squeak" (low = 650kHz clock). Coin counter right is at 0x1034 (bit D7, active high) and coin counter left is at 0x1035 (bit D7, active high).
+
+Addresses 0x1800-0x180f are used to control the POKEY chip, which is responsible for generating sound effects. The POKEY chip has multiple registers that can be written to in order to control various aspects of the sound it produces.
+
+Addresses 0x1810 and 0x1811 are used to control the YM2151 sound chip, which is responsible for generating music. The YM2151 has two registers: one for selecting the register to write to (0x1810), and one for writing the data to that register (0x1811).
+
+Address 0x1830 is used to control the TMS5220 speech synthesis chip. Writing to this address sends data to the chip, though very little is known about the specifics. More information might be available in the TMS5220 datasheet.
+
+Address 0x1830 is marked as "interrupt acknowledge".
+
+Program ROM (which includes both code, and whatever data is needed to play music, sfx, and speech) is mapped between 0x4000 and 0xffff.
