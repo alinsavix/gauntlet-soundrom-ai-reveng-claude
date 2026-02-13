@@ -10,7 +10,7 @@ The results were, to put it lightly, impressive, and complete to a depth that I 
 
 Also, the Gauntlet II sound ROM implements a kind of non-trivial bytecode for making sounds happen! That's not that surprising, but still an impressive amount of sophistication
 
-## Reverse Engineering Results
+## Results
 
 My original prompt is in [PROMPT.md](prompting/PROMPT.md). I provided the prompt, and the operational documentation present in the [docs](docs) directory (typed up by me, derived from my own knowledge, the schematics, and the datasheets for the various chips).
 
