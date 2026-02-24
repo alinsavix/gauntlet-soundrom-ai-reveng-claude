@@ -5,6 +5,9 @@ Decodes the bytecode sequences in the Gauntlet sound ROM (48KB, 6502-based
 sound coprocessor). Resolves any of the 219 sound commands to their
 underlying sequence data and produces human-readable disassembly.
 
+Includes TMS5220 LPC speech synthesis (ported from MAME's tms5220.cpp) for
+decoding and exporting the ~140 speech phrases as WAV files.
+
 Usage:
     python gauntlet_disasm.py soundrom.bin --cmd 0x0D
     python gauntlet_disasm.py soundrom.bin --list
@@ -14,6 +17,10 @@ Usage:
     python gauntlet_disasm.py soundrom.bin --score 0x3B
     python gauntlet_disasm.py soundrom.bin --midi 0x3B
     python gauntlet_disasm.py soundrom.bin --midi 0x3B --midi-out theme.mid
+    python gauntlet_disasm.py soundrom.bin --speech-wav 0x5A
+    python gauntlet_disasm.py soundrom.bin --speech-wav 0x5A --out needs_food.wav
+    python gauntlet_disasm.py soundrom.bin --speech-all
+    python gauntlet_disasm.py soundrom.bin --speech-all --out-dir my_speech/
 """
 
 import argparse
@@ -21,6 +28,7 @@ import csv
 import os
 import struct
 import sys
+import wave
 
 # ── ROM Layout ────────────────────────────────────────────────────────────────
 
@@ -119,6 +127,372 @@ DURATION_ABBREVS = {
     "dotted-32nd":      "32.",
     "triplet-quarter":  "Qtr",
 }
+
+# ── TMS5220 Speech Synthesis Tables ──────────────────────────────────────────
+#
+# From MAME's tms5110r.hxx: tms5220_coeff struct (TI_028X_LATER_ENERGY,
+# TI_5220_PITCH, TI_5110_5220_LPC, TI_LATER_CHIRP, TI_INTERP).
+
+TMS5220_ENERGY_TABLE = [0, 1, 2, 3, 4, 6, 8, 11, 16, 23, 33, 47, 63, 85, 114, 0]
+
+TMS5220_PITCH_TABLE = [
+    0,  15,  16,  17,  18,  19,  20,  21,  22,  23,  24,  25,  26,  27,  28,  29,
+   30,  31,  32,  33,  34,  35,  36,  37,  38,  39,  40,  41,  42,  44,  46,  48,
+   50,  52,  53,  56,  58,  60,  62,  65,  68,  70,  72,  76,  78,  80,  84,  86,
+   91,  94,  98, 101, 105, 109, 114, 118, 122, 127, 132, 137, 142, 148, 153, 159,
+]
+
+TMS5220_K1_TABLE = [
+    -501, -498, -497, -495, -493, -491, -488, -482,
+    -478, -474, -469, -464, -459, -452, -445, -437,
+    -412, -380, -339, -288, -227, -158,  -81,   -1,
+      80,  157,  226,  287,  337,  379,  411,  436,
+]
+TMS5220_K2_TABLE = [
+    -328, -303, -274, -244, -211, -175, -138,  -99,
+     -59,  -18,   24,   64,  105,  143,  180,  215,
+     248,  278,  306,  331,  354,  374,  392,  408,
+     422,  435,  445,  455,  463,  470,  476,  506,
+]
+TMS5220_K3_TABLE = [
+    -441, -387, -333, -279, -225, -171, -117, -63,
+      -9,   45,   98,  152,  206,  260,  314, 368,
+]
+TMS5220_K4_TABLE = [
+    -328, -273, -217, -161, -106,  -50,    5,  61,
+     116,  172,  228,  283,  339,  394,  450, 506,
+]
+TMS5220_K5_TABLE = [
+    -328, -282, -235, -189, -142,  -96,  -50,  -3,
+      43,   90,  136,  182,  229,  275,  322, 368,
+]
+TMS5220_K6_TABLE = [
+    -256, -212, -168, -123,  -79,  -35,   10,  54,
+      98,  143,  187,  232,  276,  320,  365, 409,
+]
+TMS5220_K7_TABLE = [
+    -308, -260, -212, -164, -117,  -69,  -21,  27,
+      75,  122,  170,  218,  266,  314,  361, 409,
+]
+TMS5220_K8_TABLE = [-256, -161, -66, 29, 124, 219, 314, 409]
+TMS5220_K9_TABLE = [-256, -176, -96, -15, 65, 146, 226, 307]
+TMS5220_K10_TABLE = [-205, -132, -59, 14, 87, 160, 234, 307]
+
+TMS5220_K_TABLES = [
+    TMS5220_K1_TABLE, TMS5220_K2_TABLE, TMS5220_K3_TABLE, TMS5220_K4_TABLE,
+    TMS5220_K5_TABLE, TMS5220_K6_TABLE, TMS5220_K7_TABLE, TMS5220_K8_TABLE,
+    TMS5220_K9_TABLE, TMS5220_K10_TABLE,
+]
+
+# Chirp excitation table (TI_LATER_CHIRP) — 52 entries, treated as signed int8
+TMS5220_CHIRP_TABLE = [
+    0x00, 0x03, 0x0F, 0x28, 0x4C, 0x6C, 0x71, 0x50,
+    0x25, 0x26, 0x4C, 0x44, 0x1A, 0x32, 0x3B, 0x13,
+    0x37, 0x1A, 0x25, 0x1F, 0x1D, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+]
+
+TMS5220_INTERP_COEFF = [0, 3, 3, 3, 2, 2, 1, 1]
+TMS5220_KBITS = [5, 5, 4, 4, 4, 4, 4, 3, 3, 3]
+TMS5220_SAMPLE_RATE = 8000
+
+
+# ── TMS5220 Speech Emulator ─────────────────────────────────────────────────
+
+class TMS5220Emulator:
+    """TMS5220 LPC speech synthesizer emulation.
+
+    Ported from MAME's tms5220.cpp. Implements Speak External mode:
+    raw LPC bitstream data in, signed 16-bit PCM samples out.
+    """
+
+    def __init__(self):
+        self._reset()
+
+    def _reset(self):
+        """Reset all internal state."""
+        # Filter state
+        self.u = [0] * 11
+        self.x = [0] * 10
+
+        # Current interpolated parameters
+        self.current_energy = 0
+        self.current_pitch = 0
+        self.current_k = [0] * 10
+        self.previous_energy = 0
+
+        # New frame target indices
+        self.new_frame_energy_idx = 0
+        self.new_frame_pitch_idx = 0
+        self.new_frame_k_idx = [0] * 10
+
+        # Control flags
+        self.OLDE = True
+        self.OLDP = True
+        self.zpar = True
+        self.uv_zpar = True
+        self.inhibit = False
+        self.pitch_zero = False
+
+        # Counters (subc_reload=1 for TMS5220 normal speech rate;
+        # produces 200 samples/frame.  subc_reload=0 is SPKSLOW.)
+        self.subc_reload = 1
+        self.IP = 0
+        self.PC = 0
+        self.subcycle = self.subc_reload
+        self.pitch_count = 0
+
+        # LFSR (13-bit, init 0x1FFF)
+        self.RNG = 0x1FFF
+
+        self.excitation_data = 0
+
+        # Talk state
+        self.SPEN = False
+        self.TALK = False
+        self.TALKD = False
+
+        # Bitstream state
+        self.data = b''
+        self.byte_pos = 0
+        self.bit_pos = 0
+
+    def _read_bits(self, count):
+        """Read N bits from data buffer (LSB-first per byte, MSB-first into result)."""
+        val = 0
+        for _ in range(count):
+            if self.byte_pos < len(self.data):
+                bit = (self.data[self.byte_pos] >> self.bit_pos) & 1
+            else:
+                bit = 0
+            val = (val << 1) | bit
+            self.bit_pos += 1
+            if self.bit_pos >= 8:
+                self.byte_pos += 1
+                self.bit_pos = 0
+        return val
+
+    def _parse_frame(self):
+        """Parse one LPC frame from the bitstream."""
+        self.uv_zpar = 0
+        self.zpar = 0
+
+        self.new_frame_energy_idx = self._read_bits(4)
+        if self.new_frame_energy_idx == 0 or self.new_frame_energy_idx == 15:
+            return
+
+        rep_flag = self._read_bits(1)
+        self.new_frame_pitch_idx = self._read_bits(6)
+        self.uv_zpar = int(self.new_frame_pitch_idx == 0)
+
+        if rep_flag:
+            return
+
+        for i in range(4):
+            self.new_frame_k_idx[i] = self._read_bits(TMS5220_KBITS[i])
+
+        if self.new_frame_pitch_idx == 0:
+            return
+
+        for i in range(4, 10):
+            self.new_frame_k_idx[i] = self._read_bits(TMS5220_KBITS[i])
+
+    @staticmethod
+    def _matrix_multiply(a, b):
+        """10-bit x 14-bit fixed-point multiply with >>9 shift."""
+        a = ((a + 512) % 1024) - 512
+        b = ((b + 16384) % 32768) - 16384
+        return (a * b) >> 9
+
+    def _lattice_filter(self):
+        """10-stage lattice filter (direct port from MAME lines 1308-1373)."""
+        mm = self._matrix_multiply
+        self.u[10] = mm(self.previous_energy, self.excitation_data << 6)
+        self.u[9] = self.u[10] - mm(self.current_k[9], self.x[9])
+        self.u[8] = self.u[9] - mm(self.current_k[8], self.x[8])
+        self.u[7] = self.u[8] - mm(self.current_k[7], self.x[7])
+        self.u[6] = self.u[7] - mm(self.current_k[6], self.x[6])
+        self.u[5] = self.u[6] - mm(self.current_k[5], self.x[5])
+        self.u[4] = self.u[5] - mm(self.current_k[4], self.x[4])
+        self.u[3] = self.u[4] - mm(self.current_k[3], self.x[3])
+        self.u[2] = self.u[3] - mm(self.current_k[2], self.x[2])
+        self.u[1] = self.u[2] - mm(self.current_k[1], self.x[1])
+        self.u[0] = self.u[1] - mm(self.current_k[0], self.x[0])
+        # Backward path (x updates in reverse)
+        self.x[9] = self.x[8] + mm(self.current_k[8], self.u[8])
+        self.x[8] = self.x[7] + mm(self.current_k[7], self.u[7])
+        self.x[7] = self.x[6] + mm(self.current_k[6], self.u[6])
+        self.x[6] = self.x[5] + mm(self.current_k[5], self.u[5])
+        self.x[5] = self.x[4] + mm(self.current_k[4], self.u[4])
+        self.x[4] = self.x[3] + mm(self.current_k[3], self.u[3])
+        self.x[3] = self.x[2] + mm(self.current_k[2], self.u[2])
+        self.x[2] = self.x[1] + mm(self.current_k[1], self.u[1])
+        self.x[1] = self.x[0] + mm(self.current_k[0], self.u[0])
+        self.x[0] = self.u[0]
+        self.previous_energy = self.current_energy
+        return self.u[0]
+
+    @staticmethod
+    def _clip_analog(sample):
+        """Clamp to 12-bit range and upshift to 16-bit (MAME lines 1243-1274)."""
+        sample = ((sample + 16384) % 32768) - 16384
+        if sample > 2047:
+            sample = 2047
+        elif sample < -2048:
+            sample = -2048
+        sample &= ~0xF
+        u16 = sample & 0xFFFF
+        result = ((u16 << 4) & 0xFFFF) | ((u16 & 0x7F0) >> 3) | ((u16 & 0x400) >> 10)
+        if result >= 32768:
+            result -= 65536
+        return result
+
+    def synthesize(self, data_bytes):
+        """Feed raw LPC bitstream bytes, return list of int16 PCM samples."""
+        self._reset()
+        self.data = data_bytes
+        if not data_bytes:
+            return []
+
+        # Speak External: set up for immediate speech
+        self.SPEN = True
+        self.TALK = True
+        self.TALKD = True
+        self.zpar = 1
+        self.uv_zpar = 1
+        self.OLDE = True
+        self.OLDP = True
+
+        # Initialize frame indices (matches MAME speak external init)
+        for i in range(4):
+            self.new_frame_k_idx[i] = 0
+        for i in range(4, 7):
+            self.new_frame_k_idx[i] = 0xF
+        for i in range(7, 10):
+            self.new_frame_k_idx[i] = 0x7
+
+        samples = []
+        max_samples = len(data_bytes) * 8 * 50  # generous upper bound
+
+        while len(samples) < max_samples:
+            if self.TALKD:
+                # ── New frame? (IP=0, PC=12, subcycle=1) ─────────────
+                if self.IP == 0 and self.PC == 12 and self.subcycle == 1:
+                    self.IP = 0  # reload_table[0]
+                    self._parse_frame()
+
+                    if self.new_frame_energy_idx == 0xF:
+                        self.TALK = False
+                        self.SPEN = False
+
+                    old_uv = self.OLDP
+                    old_si = self.OLDE
+                    new_uv = (self.new_frame_pitch_idx == 0)
+                    new_si = (self.new_frame_energy_idx == 0)
+
+                    if ((not old_uv and new_uv) or
+                            (old_uv and not new_uv) or
+                            (old_si and not new_si) or
+                            (old_uv and new_si)):
+                        self.inhibit = True
+                    else:
+                        self.inhibit = False
+
+                else:
+                    # ── Interpolation at subcycle 2 (B cycle) ────────
+                    inhibit_state = int(self.inhibit and (self.IP != 0))
+
+                    if self.subcycle == 2:
+                        shift = TMS5220_INTERP_COEFF[self.IP]
+                        if self.PC == 0:
+                            if self.IP == 0:
+                                self.pitch_zero = False
+                            tgt = TMS5220_ENERGY_TABLE[self.new_frame_energy_idx]
+                            self.current_energy = (
+                                self.current_energy +
+                                (((tgt - self.current_energy) *
+                                  (1 - inhibit_state)) >> shift)
+                            ) * (1 - self.zpar)
+                        elif self.PC == 1:
+                            tgt = TMS5220_PITCH_TABLE[self.new_frame_pitch_idx]
+                            self.current_pitch = (
+                                self.current_pitch +
+                                (((tgt - self.current_pitch) *
+                                  (1 - inhibit_state)) >> shift)
+                            ) * (1 - self.zpar)
+                        elif 2 <= self.PC <= 11:
+                            ki = self.PC - 2
+                            tgt = TMS5220_K_TABLES[ki][self.new_frame_k_idx[ki]]
+                            zp = self.zpar if ki < 4 else self.uv_zpar
+                            self.current_k[ki] = (
+                                self.current_k[ki] +
+                                (((tgt - self.current_k[ki]) *
+                                  (1 - inhibit_state)) >> shift)
+                            ) * (1 - int(zp))
+
+                # ── Excitation ───────────────────────────────────────
+                if self.OLDP:  # old frame unvoiced
+                    self.excitation_data = -64 if (self.RNG & 1) else 64
+                else:  # voiced
+                    idx = min(self.pitch_count, 51)
+                    v = TMS5220_CHIRP_TABLE[idx]
+                    self.excitation_data = v - 256 if v > 127 else v
+
+                # ── LFSR (20 ticks per sample) ───────────────────────
+                for _ in range(20):
+                    bitout = (((self.RNG >> 12) ^ (self.RNG >> 3) ^
+                               (self.RNG >> 2) ^ self.RNG) & 1)
+                    self.RNG = ((self.RNG << 1) | bitout) & 0x1FFF
+
+                # ── Lattice filter + clip ────────────────────────────
+                raw = self._lattice_filter()
+                samples.append(self._clip_analog(raw))
+
+                # ── Update counters ──────────────────────────────────
+                self.subcycle += 1
+                if self.subcycle == 2 and self.PC == 12:
+                    if self.IP == 7 and self.inhibit:
+                        self.pitch_zero = True
+                    if self.IP == 7:
+                        self.OLDE = (self.new_frame_energy_idx == 0)
+                        self.OLDP = (self.new_frame_pitch_idx == 0)
+                        self.TALKD = self.TALK
+                        if not self.TALK and self.SPEN:
+                            self.TALK = True
+                    self.subcycle = self.subc_reload
+                    self.PC = 0
+                    self.IP = (self.IP + 1) & 0x7
+                elif self.subcycle == 3:
+                    self.subcycle = self.subc_reload
+                    self.PC += 1
+
+                self.pitch_count += 1
+                if self.pitch_count >= self.current_pitch or self.pitch_zero:
+                    self.pitch_count = 0
+                self.pitch_count &= 0x1FF
+
+            else:
+                # Not talking — run counters, wait for TALKD
+                self.subcycle += 1
+                if self.subcycle == 2 and self.PC == 12:
+                    if self.IP == 7:
+                        self.TALKD = self.TALK
+                        if not self.TALK and self.SPEN:
+                            self.TALK = True
+                    self.subcycle = self.subc_reload
+                    self.PC = 0
+                    self.IP = (self.IP + 1) & 0x7
+                elif self.subcycle == 3:
+                    self.subcycle = self.subc_reload
+                    self.PC += 1
+
+                if not self.TALK and not self.SPEN and not self.TALKD:
+                    break
+
+        return samples
 
 
 class TimedEvent:
@@ -1034,6 +1408,90 @@ def midi_command(rom, cmd, names, output_path):
     print(f"  Output: {output_path}")
 
 
+# ── Speech WAV Export ────────────────────────────────────────────────────────
+
+def speech_to_wav(rom, cmd, names, out_path):
+    """Synthesize a speech command to a WAV file."""
+    info = resolve_command(rom, cmd)
+    if info is None:
+        print(f"Invalid command number: 0x{cmd:02X}", file=sys.stderr)
+        return
+
+    if not info.is_speech:
+        print(f"Command 0x{cmd:02X}: not a speech command "
+              f"(type {info.handler_type}: {info.type_name})")
+        return
+
+    data = rom.read_bytes(info.seq_ptr, info.seq_len)
+    emu = TMS5220Emulator()
+    samples = emu.synthesize(data)
+
+    if not samples:
+        print(f"Command 0x{cmd:02X}: synthesis produced no samples")
+        return
+
+    # Write 16-bit mono WAV
+    with wave.open(out_path, 'w') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(TMS5220_SAMPLE_RATE)
+        pcm = struct.pack(f'<{len(samples)}h', *samples)
+        wf.writeframes(pcm)
+
+    duration = len(samples) / TMS5220_SAMPLE_RATE
+    name_info = names.get(cmd)
+    label = f'"{name_info[1]}"' if name_info else f"0x{cmd:02X}"
+    print(f"Speech command 0x{cmd:02X} {label}:")
+    print(f"  LPC data: ${info.seq_ptr:04X} ({info.seq_len} bytes)")
+    print(f"  Samples: {len(samples)} ({duration:.2f}s @ {TMS5220_SAMPLE_RATE} Hz)")
+    print(f"  Output: {out_path}")
+
+
+def speech_all_to_wav(rom, names, out_dir):
+    """Synthesize all speech commands to WAV files in a directory."""
+    os.makedirs(out_dir, exist_ok=True)
+
+    count = 0
+    for cmd in range(MAX_COMMANDS):
+        info = resolve_command(rom, cmd)
+        if info is None or not info.is_speech:
+            continue
+
+        name_info = names.get(cmd)
+        if name_info:
+            # Sanitize description for filename
+            safe = name_info[1].replace(' ', '_').replace('"', '').replace("'", '')
+            safe = ''.join(c for c in safe if c.isalnum() or c in '_-')
+            safe = safe.strip('_-')
+            fname = f"0x{cmd:02X}_{safe}.wav"
+        else:
+            fname = f"0x{cmd:02X}.wav"
+
+        out_path = os.path.join(out_dir, fname)
+        data = rom.read_bytes(info.seq_ptr, info.seq_len)
+        emu = TMS5220Emulator()
+        samples = emu.synthesize(data)
+
+        if not samples:
+            print(f"  0x{cmd:02X}: no samples (skipped)")
+            continue
+
+        with wave.open(out_path, 'w') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(TMS5220_SAMPLE_RATE)
+            pcm = struct.pack(f'<{len(samples)}h', *samples)
+            wf.writeframes(pcm)
+
+        duration = len(samples) / TMS5220_SAMPLE_RATE
+        label = f'"{name_info[1]}"' if name_info else ""
+        print(f"  0x{cmd:02X}: {info.seq_len:4d} bytes -> "
+              f"{len(samples):6d} samples ({duration:.2f}s)  {label}  -> {fname}")
+        count += 1
+
+    print(f"\nExported {count} speech commands to {out_dir}/")
+
+
 def score_command(rom, cmd, names):
     """Top-level function for --score mode.
 
@@ -1335,10 +1793,13 @@ def parse_int(s):
 
 def find_csv(rom_path):
     """Auto-detect soundcmds.csv near the ROM file."""
+    rom_dir = os.path.dirname(os.path.abspath(rom_path))
+    cwd = os.getcwd()
     candidates = [
-        os.path.join(os.path.dirname(os.path.abspath(rom_path)),
-                     "soundcmds.csv"),
-        os.path.join(os.getcwd(), "soundcmds.csv"),
+        os.path.join(rom_dir, "soundcmds.csv"),
+        os.path.join(cwd, "soundcmds.csv"),
+        os.path.join(rom_dir, "docs", "soundcmds.csv"),
+        os.path.join(cwd, "docs", "soundcmds.csv"),
     ]
     for c in candidates:
         if os.path.exists(c):
@@ -1361,6 +1822,8 @@ Examples:
   %(prog)s soundrom.bin --score 0x3B     # Score/tracker view
   %(prog)s soundrom.bin --midi 0x3B      # Export as MIDI file
   %(prog)s soundrom.bin --midi 0x3B --midi-out theme.mid
+  %(prog)s soundrom.bin --speech-wav 0x5A # Synthesize speech to WAV
+  %(prog)s soundrom.bin --speech-all      # Export all speech as WAVs
 """)
 
     parser.add_argument("rom", help="Path to soundrom.bin (48KB)")
@@ -1381,6 +1844,14 @@ Examples:
     parser.add_argument("--midi-out", metavar="FILE",
                         help="Output path for MIDI file "
                              "(default: command_0xNN.mid)")
+    parser.add_argument("--speech-wav", type=parse_int, metavar="N",
+                        help="Synthesize speech command N to WAV file")
+    parser.add_argument("--speech-all", action="store_true",
+                        help="Synthesize all speech commands to WAV files")
+    parser.add_argument("--out", metavar="FILE",
+                        help="Output path for WAV file (default: auto-generated)")
+    parser.add_argument("--out-dir", metavar="DIR",
+                        help="Output directory for --speech-all (default: speech/)")
     parser.add_argument("--csv", metavar="FILE",
                         help="Path to soundcmds.csv (auto-detected if omitted)")
 
@@ -1398,7 +1869,15 @@ Examples:
 
     # ── Execute action ────────────────────────────────────────────────────
 
-    if args.midi is not None:
+    if args.speech_wav is not None:
+        out = args.out or f"speech_0x{args.speech_wav:02X}.wav"
+        speech_to_wav(rom, args.speech_wav, names, out)
+
+    elif args.speech_all:
+        out_dir = args.out_dir or "speech"
+        speech_all_to_wav(rom, names, out_dir)
+
+    elif args.midi is not None:
         midi_out = args.midi_out or f"command_0x{args.midi:02X}.mid"
         midi_command(rom, args.midi, names, midi_out)
 
