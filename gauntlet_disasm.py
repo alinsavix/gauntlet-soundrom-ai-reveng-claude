@@ -1368,8 +1368,9 @@ class SequenceInterpreter:
         """
         events = []
         pc = start_addr
-        return_stack = []
-        visited = set()
+        return_stack = []     # for PUSH_SEQ (0x8D) call/return
+        loop_stack = []       # for PUSH_SEQ_EXT (0x8E) repeat loops
+                              # each entry: [loop_start_addr, remaining_count]
 
         tempo = 0
         volume = 0
@@ -1385,7 +1386,7 @@ class SequenceInterpreter:
 
         cumulative_frames = 0.0
         max_frames = max_seconds * 120.0
-        max_instructions = 2000
+        max_instructions = 50000
 
         pokey_ch_idx = max(0, (channel_id - 8)) if channel_id >= 8 else 0
 
@@ -1394,10 +1395,7 @@ class SequenceInterpreter:
                 break
             if pc < ROM_BASE or pc > ROM_END:
                 break
-            if pc in visited and len(visited) > 500:
-                break
 
-            visited.add(pc)
             byte0 = self.rom.read_byte(pc)
 
             # End marker
@@ -1538,12 +1536,21 @@ class SequenceInterpreter:
                 else:
                     pc = ret
                     continue
+            elif byte0 == 0x8E and args:     # PUSH_SEQ_EXT (repeat loop)
+                loop_count = args[0]
+                loop_start = pc + 2  # addr after this instruction
+                if loop_count > 1:
+                    loop_stack.append([loop_start, loop_count])
+                # Execution continues linearly (no jump)
             elif byte0 == 0x8F:              # POP_SEQ
-                if return_stack:
-                    pc = return_stack.pop()
-                    continue
-                else:
-                    break
+                if loop_stack:
+                    loop_stack[-1][1] -= 1
+                    if loop_stack[-1][1] > 0:
+                        pc = loop_stack[-1][0]  # loop back
+                        continue
+                    else:
+                        loop_stack.pop()  # done looping
+                # No loop active or loop done: continue linearly (no-op)
             elif byte0 == 0x90:              # SWITCH_POKEY
                 hw_mode = "POKEY"
             elif byte0 == 0x91:              # SWITCH_YM2151
@@ -1561,14 +1568,20 @@ class SequenceInterpreter:
             elif byte0 == 0x9C:              # FORCE_POKEY
                 hw_mode = "POKEY"
             elif byte0 == 0x9D and len(args) >= 2:  # SET_VOICE (YM2151)
-                if hw_mode == "YM2151" and self.ym2151:
+                if hw_mode == "YM2151":
                     voice_ptr = args[0] | (args[1] << 8)
-                    self._load_ym_voice(channel_id, voice_ptr)
+                    time_secs = cumulative_frames / 120.0
+                    for reg, val in self._load_ym_voice(channel_id,
+                                                        voice_ptr):
+                        events.append((time_secs, 'ym_reg_write',
+                                       (reg, val)))
             elif byte0 == 0x9E and len(args) >= 2:  # YM_LOAD_ENV
-                pass  # envelope table load (handled through events)
+                pass  # envelope table load
             elif byte0 == 0x9F and len(args) >= 2:  # YM_LOAD_REG
-                if hw_mode == "YM2151" and self.ym2151:
-                    self.ym2151.write(args[0], args[1])
+                if hw_mode == "YM2151":
+                    time_secs = cumulative_frames / 120.0
+                    events.append((time_secs, 'ym_reg_write',
+                                   (args[0], args[1])))
             elif byte0 == 0xA0 and args:     # FREQ_OFFSET
                 val = args[0]
                 if val >= 128:
@@ -1641,33 +1654,29 @@ class SequenceInterpreter:
         return events
 
     def _load_ym_voice(self, channel, voice_ptr):
-        """Load a YM2151 voice definition from ROM into chip registers."""
-        if not self.ym2151:
-            return
+        """Build register writes for a YM2151 voice definition from ROM.
+
+        Returns list of (register, value) tuples.
+        """
+        writes = []
         try:
             ch = channel & 0x07
-            # Voice data layout: 4 operators × 6 registers + 2 channel regs
-            # Read FB/CON first
             fb_con = self.rom.read_byte(voice_ptr)
-            self.ym2151.write(0x20 + ch, fb_con | 0xC0)  # L+R enabled
+            writes.append((0x20 + ch, fb_con | 0xC0))  # L+R enabled
             ptr = voice_ptr + 1
 
-            # For each operator slot (M1, M2, C1, C2):
-            slot_bases = [0x40, 0x50, 0x48, 0x58]  # DT1/MUL register bases
-            reg_offsets = [
-                (0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0),  # register base addrs
-            ]
-            for slot_i, slot_base in enumerate(
-                    [(0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0),   # M1
-                     (0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0),   # M2
-                     (0x48, 0x68, 0x88, 0xA8, 0xC8, 0xE8),   # C1
-                     (0x58, 0x78, 0x98, 0xB8, 0xD8, 0xF8)]): # C2
+            for slot_base in [
+                    (0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0),   # M1
+                    (0x50, 0x70, 0x90, 0xB0, 0xD0, 0xF0),   # M2
+                    (0x48, 0x68, 0x88, 0xA8, 0xC8, 0xE8),   # C1
+                    (0x58, 0x78, 0x98, 0xB8, 0xD8, 0xF8)]:  # C2
                 for reg_base in slot_base:
                     val = self.rom.read_byte(ptr)
-                    self.ym2151.write(reg_base + ch, val)
+                    writes.append((reg_base + ch, val))
                     ptr += 1
         except (ValueError, IndexError):
             pass
+        return writes
 
     def _render_pokey_events(self, events, max_seconds, sample_rate):
         """Render POKEY events to mono PCM samples."""
@@ -1784,7 +1793,10 @@ class SequenceInterpreter:
             while (event_idx < len(events) and
                    int(events[event_idx][0] * sample_rate) <= current_sample):
                 t, etype, data = events[event_idx]
-                if etype == 'ym_note_on':
+                if etype == 'ym_reg_write':
+                    reg, val = data
+                    self.ym2151.write(reg, val)
+                elif etype == 'ym_note_on':
                     ch, kc, vol = data
                     ch = ch & 0x07
                     self.ym2151.write(0x28 + ch, kc)
@@ -2814,8 +2826,6 @@ def _normalize_mono(samples, target_peak=0.9):
         return samples
     target = int(32767 * target_peak)
     scale = target / peak
-    if scale <= 1.0:
-        return samples  # already loud enough
     return [max(-32768, min(32767, int(s * scale))) for s in samples]
 
 
@@ -2828,8 +2838,6 @@ def _normalize_stereo(samples, target_peak=0.9):
         return samples
     target = int(32767 * target_peak)
     scale = target / peak
-    if scale <= 1.0:
-        return samples
     return [(max(-32768, min(32767, int(l * scale))),
              max(-32768, min(32767, int(r * scale))))
             for l, r in samples]
@@ -2890,29 +2898,61 @@ def sfx_to_wav(rom, cmd, names, out_path, sample_rate=44100):
         print(f"Command 0x{cmd:02X}: rendering produced no audio")
         return
 
-    # Mix all channels
+    # Mix all channels using float accumulation to avoid clipping.
+    # Scale each chip group (POKEY vs YM2151) to contribute equally,
+    # then normalize the final mix.
     has_stereo = any(t == 'stereo' for t, _ in all_samples)
+    max_len = max(len(s) for _, s in all_samples)
 
-    if has_stereo:
-        # Mix to stereo
-        max_len = max(len(s) for _, s in all_samples)
-        mixed_l = [0] * max_len
-        mixed_r = [0] * max_len
-        for stype, sdata in all_samples:
+    # Accumulate in float — separate POKEY and YM groups
+    pokey_l = [0.0] * max_len
+    pokey_r = [0.0] * max_len
+    ym_l = [0.0] * max_len
+    ym_r = [0.0] * max_len
+    n_pokey = 0
+    n_ym = 0
+
+    for stype, sdata in all_samples:
+        if stype == 'stereo':
+            n_ym += 1
             for i in range(len(sdata)):
-                if stype == 'stereo':
-                    mixed_l[i] += sdata[i][0]
-                    mixed_r[i] += sdata[i][1]
-                else:
-                    mixed_l[i] += sdata[i]
-                    mixed_r[i] += sdata[i]
-        # Clamp
+                ym_l[i] += sdata[i][0]
+                ym_r[i] += sdata[i][1]
+        else:
+            n_pokey += 1
+            for i in range(len(sdata)):
+                pokey_l[i] += sdata[i]
+                pokey_r[i] += sdata[i]
+
+    # Find peak of each group
+    pokey_peak = max(max(abs(pokey_l[i]), abs(pokey_r[i]))
+                     for i in range(max_len)) if n_pokey else 0
+    ym_peak = max(max(abs(ym_l[i]), abs(ym_r[i]))
+                  for i in range(max_len)) if n_ym else 0
+
+    # Scale each group so its peak fits in roughly half of int16 range.
+    # This ensures neither chip dominates the other in the mix.
+    # When only one chip is present, it gets the full range.
+    if n_pokey > 0 and n_ym > 0:
+        # Both present: give each half the headroom
+        target = 16000.0
+        pk_scale = (target / pokey_peak) if pokey_peak > 0 else 0.0
+        ym_scale = (target / ym_peak) if ym_peak > 0 else 0.0
+    elif n_pokey > 0:
+        pk_scale = (29000.0 / pokey_peak) if pokey_peak > 0 else 0.0
+        ym_scale = 0.0
+    else:
+        pk_scale = 0.0
+        ym_scale = (29000.0 / ym_peak) if ym_peak > 0 else 0.0
+
+    # Final mix
+    if has_stereo:
         mixed = []
         for i in range(max_len):
-            l = max(-32768, min(32767, mixed_l[i]))
-            r = max(-32768, min(32767, mixed_r[i]))
-            mixed.append((l, r))
-        mixed = _normalize_stereo(mixed)
+            l = pokey_l[i] * pk_scale + ym_l[i] * ym_scale
+            r = pokey_r[i] * pk_scale + ym_r[i] * ym_scale
+            mixed.append((max(-32768, min(32767, int(l))),
+                          max(-32768, min(32767, int(r)))))
 
         with wave.open(out_path, 'w') as wf:
             wf.setnchannels(2)
@@ -2924,15 +2964,10 @@ def sfx_to_wav(rom, cmd, names, out_path, sample_rate=44100):
             wf.writeframes(pcm)
         n_samples = len(mixed)
     else:
-        # Mix to mono
-        max_len = max(len(s) for _, s in all_samples)
-        mixed = [0] * max_len
-        for _, sdata in all_samples:
-            for i in range(len(sdata)):
-                mixed[i] += sdata[i]
-        # Clamp
-        mixed = [max(-32768, min(32767, s)) for s in mixed]
-        mixed = _normalize_mono(mixed)
+        mixed = []
+        for i in range(max_len):
+            s = pokey_l[i] * pk_scale + ym_l[i] * ym_scale
+            mixed.append(max(-32768, min(32767, int(s))))
 
         with wave.open(out_path, 'w') as wf:
             wf.setnchannels(1)
@@ -3046,14 +3081,6 @@ def music_to_wav(rom, cmd, names, out_path, sample_rate=44100):
           flush=True)
 
     ym.reset()
-    # Also load voices for all channels first
-    for ch in ym_channels:
-        interp = SequenceInterpreter(rom, ym2151=ym)
-        # Re-interpret just to load voices (the events are already collected)
-        interp._interpret_sequence(ch.seq_ptr, ch.channel, "YM2151",
-                                   max_seconds=300.0)
-
-    ym.reset()
     samples = []
     current_sample = 0
     event_idx = 0
@@ -3076,7 +3103,10 @@ def music_to_wav(rom, cmd, names, out_path, sample_rate=44100):
         while (event_idx < len(all_events) and
                int(all_events[event_idx][0] * sample_rate) <= current_sample):
             t, etype, data = all_events[event_idx]
-            if etype == 'ym_note_on':
+            if etype == 'ym_reg_write':
+                reg, val = data
+                ym.write(reg, val)
+            elif etype == 'ym_note_on':
                 ch_id, kc, vol = data
                 ch_id = ch_id & 0x07
                 ym.write(0x28 + ch_id, kc)

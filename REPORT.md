@@ -3776,17 +3776,17 @@ end_of_list:
 
 ### 12.4 channel_list_unlink (0x42F9) — 53 bytes
 
-**Purpose**: Removes a channel from both its active linked lists (0x06D8 and 0x06BA chains). Walks each chain, swapping pointers to unlink the target.
+**Purpose**: Removes a channel from both its active stacks (0x06D8 = PUSH_SEQ_EXT repeat loop stack, 0x06BA = PUSH_SEQ subroutine call stack). Walks each chain, swapping pointers to unlink the target.
 
 ```
-For chain 0x06D8,X:
+For chain 0x06D8,X (repeat loop stack):
   While entry != 0:
     Call channel_state_ptr_calc
     Swap current link with $14
     Store $14 back into link field
     Move to next
 
-For chain 0x06BA,X:
+For chain 0x06BA,X (subroutine call stack):
   Same process
 
 Restore Y and return
@@ -4172,9 +4172,9 @@ skip_ym:
 | 0x8A | 0x51B3 | SET_DISTORTION | 1 | Set distortion mask ($0642) |
 | 0x8B | 0x51B7 | SET_CTRL_BITS | 1 | Set control bits ($03EA) |
 | 0x8C | 0x51CB | CLR_CTRL_BITS | 1 | Clear control bits ($03CC/$03EA) |
-| 0x8D | 0x51E2 | SET_VIBRATO | 1 | Set vibrato depth ($0660) |
-| 0x8E | 0x51E6 | PUSH_SEQ | 2 | Push current pointer, set new (linked segment) |
-| 0x8F | 0x5214 | PUSH_SEQ_EXT | 1 | Push to extended chain ($06D8) |
+| 0x8D | 0x51E6 | PUSH_SEQ | 2 | Subroutine call: push return addr, jump to target. Returns via CHAIN (byte1=0x00). *(corrected Phase 18)* |
+| 0x8E | 0x5214 | PUSH_SEQ_EXT | 1 | Repeat loop start: save seq_ptr, set counter=$06F6=arg. POP_SEQ loops back or exits when counter=0. *(corrected Phase 18)* |
+| 0x8F | 0x523F | POP_SEQ | 1 | Repeat loop end: if inside PUSH_SEQ_EXT loop, dec counter and loop back (or pop if =0). If no loop, no-op — never terminates. *(corrected Phase 18)* |
 | 0x90 | 0x54CC | SWITCH_POKEY | 1 | Switch channel to POKEY mode |
 | 0x91 | 0x54E5 | SWITCH_YM2151 | 1 | Switch channel to YM2151 mode |
 | 0x92-0x95 | 0x4719 | NOP_READ_NEXT | - | No-op (jumps to read next frame) |
@@ -4248,8 +4248,8 @@ Complete layout of per-channel arrays (indexed by X, 30 entries each):
 | $067E+X | Portamento delta low | |
 | $069C+X | Portamento delta high | |
 | $06BA+X | Segment chain A | |
-| $06D8+X | Segment chain B | |
-| $06F6+X | Extended chain counter | |
+| $06D8+X | PUSH_SEQ_EXT loop depth (0=no loop, nonzero=inside repeat) | |
+| $06F6+X | PUSH_SEQ_EXT repeat counter (decremented by POP_SEQ) | |
 | $0714+X | Envelope counter low | |
 | $0732+X | Envelope counter high | |
 | $0750+X | Envelope rate low | |
@@ -5083,8 +5083,8 @@ The 19 `JSR $5047` call sites (file offsets / CPU addresses):
 
 | Opcode | Old Name | Old Args | New Name | New Args | Handler |
 |--------|----------|----------|----------|----------|---------|
-| 0x8D | SET_VIBRATO | 1 | PUSH_SEQ | 2 | $51E6 |
-| 0x8E | PUSH_SEQ | 2 | PUSH_SEQ_EXT | 1 | $5214 |
+| 0x8D | SET_VIBRATO | 1 | PUSH_SEQ | 2 | $51E6 | Subroutine call: push return addr, jump to 16-bit target. Returns via CHAIN (byte1=0x00). |
+| 0x8E | PUSH_SEQ | 2 | PUSH_SEQ_EXT | 1 | $5214 | Repeat loop: saves seq_ptr, sets $06D8=arg (depth) and $06F6=arg (counter). Continues linearly; POP_SEQ loops back or exits. |
 | 0xA7 | COND_JUMP_EQ0 | 3 | FREQ_ADD | 1 | $56DC |
 | 0xA8 | COND_JUMP_NE0 | 3 | SET_RELEASE | 1 | $5711 |
 | 0xAE | CMP_SUB_2 | 1 | COND_JUMP | 2 | $5320 |

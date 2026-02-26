@@ -1163,9 +1163,9 @@ Byte 1 (Duration/Envelope) — only when byte 0 is a note:
 | 0x86-0x87 | 2 | Envelopes | SET_FREQ_ENV, SET_VOL_ENV (pointers) |
 | 0x88-0x89 | 1 | Timing | RESET_TIMER, SET_REPEAT |
 | 0x8A-0x8C | 1 | Control | SET_DISTORTION, SET_CTRL_BITS, CLR_CTRL_BITS |
-| 0x8D | 2 | Linking | PUSH_SEQ (push & load segment pointer) |
-| 0x8E | 1 | Linking | PUSH_SEQ_EXT (push extended chain state) |
-| 0x8F | 1 | Linking | POP_SEQ (pop from chain) |
+| 0x8D | 2 | Linking | PUSH_SEQ (push return addr, jump to 16-bit target; returns via CHAIN byte1=0x00) |
+| 0x8E | 1 | Repeat | PUSH_SEQ_EXT (start repeat loop: saves seq_ptr, sets counter=$06F6 and depth=$06D8 to arg; continues linearly) |
+| 0x8F | 1 | Repeat | POP_SEQ (if inside PUSH_SEQ_EXT loop: dec counter, loop back if >0, pop if =0; else no-op — never terminates) |
 | 0x90-0x91 | 1 | Mode | SWITCH_POKEY, SWITCH_YM2151 |
 | 0x96 | 1 | Output | QUEUE_OUTPUT to main CPU |
 | 0x97 | 1 | Reset | RESET_ENVELOPE to defaults |
@@ -1231,9 +1231,9 @@ Byte 1 (Duration/Envelope) — only when byte 0 is a note:
 | $0660+X | Vibrato depth |
 | $067E+X | Portamento delta low |
 | $069C+X | Portamento delta high |
-| $06BA+X | Segment chain A |
-| $06D8+X | Segment chain B |
-| $06F6+X | Extended chain counter |
+| $06BA+X | PUSH_SEQ call stack link (subroutine depth) |
+| $06D8+X | PUSH_SEQ_EXT loop depth (0=no loop active, nonzero=inside repeat) |
+| $06F6+X | PUSH_SEQ_EXT repeat counter (decremented by POP_SEQ each iteration) |
 | $0714+X | Envelope counter low |
 | $0732+X | Envelope counter high |
 | $0750+X | Envelope rate low |
