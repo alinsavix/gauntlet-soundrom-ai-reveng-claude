@@ -1048,7 +1048,7 @@ New handler functions:
 | 0x5FA8 | SFX data offset table | 219 bytes | Maps command → data offset |
 | 0x5FE6 | SFX flags table | 219 bytes | Sound behavior flags |
 | 0x6024 | Priority table | Variable | Sound interrupt priority |
-| 0x60DA | Channel assignment | Variable | POKEY channel routing |
+| 0x60DA | Channel assignment | Variable | Hardware channel routing (POKEY/YM2151) |
 | 0x6190 | SFX data pointers (low) | Variable | Sound sequence data |
 | 0x6290 | SFX data pointers (high) | Variable | Alternate sequence data |
 
@@ -1255,21 +1255,24 @@ empty_list:
 - Linked lists organize channels by priority
 - Multiple logical channels can map to same POKEY channel
 
-**POKEY Hardware Mapping**:
-- 4 physical channels in POKEY chip (0x1800-0x1807)
-- Channel assignment via 0x60DA table
-- Values: 04-0B map to POKEY channels 0-3 (with variations)
+**Hardware Channel Mapping**:
+- Channel assignment via 0x60DA table (values 0x00-0x0B)
+- **Channels 0x00-0x03**: POKEY (4 physical channels)
+- **Channels 0x04-0x0B**: YM2151 (8 FM synthesis channels)
 - Dynamic channel allocation based on priority
 
 **Example Channel Assignments** (from 0x60DA):
 ```
-Data offset 0: Channel 04 (POKEY channel 0, variant A)
-Data offset 1: Channel 05 (POKEY channel 1, variant A)
-Data offset 2: Channel 06 (POKEY channel 2, variant A)
-Data offset 3: Channel 07 (POKEY channel 3, variant A)
-Data offset 4: Channel 08 (POKEY channel 0, variant B)
+Data offset 0: Channel 0x00 (POKEY channel 0)
+Data offset 1: Channel 0x01 (POKEY channel 1)
+Data offset 2: Channel 0x02 (POKEY channel 2)
+Data offset 3: Channel 0x03 (POKEY channel 3)
+Data offset 4: Channel 0x04 (YM2151 channel 0)
+Data offset 5: Channel 0x08 (YM2151 channel 4)
 ...
 ```
+
+**Note**: Only 8 commands use POKEY channels (0x05, 0x43-0x49 — weapon sounds and chip test). All other type 7 commands route to YM2151, despite sharing the same handler and bytecode interpreter.
 
 ### Sound Data Format
 
@@ -1281,7 +1284,7 @@ Command 0x0D:
   Data offset: 0x13
   Flags: 0xFF (immediate play)
   Priority: 0x6024[0x13] = 0x08 (medium)
-  Channel: 0x60DA[0x13] = 0x09 (POKEY ch 1)
+  Channel: 0x60DA[0x13] = 0x09 (YM2151 ch 5)
 ```
 
 **Sound Sequence Data** (at 0x6190/0x6290):
@@ -2390,21 +2393,21 @@ Comprehensive listing of all major data tables identified throughout analysis.
 #### Table 7: SFX Channel Assignment
 - **Address**: 0x60DA
 - **Size**: ~200 bytes
-- **Format**: 1 byte per sound (channel 0x04-0x0B)
-- **Purpose**: POKEY channel routing
+- **Format**: 1 byte per sound (channel 0x00-0x0B)
+- **Purpose**: Hardware channel routing (POKEY + YM2151)
 - **Used by**: handler_type_7 (0x4598)
 - **Content Sample**:
   ```
-  04 05 06 07 08 09 0A 0B (channels 0-7)
+  04 05 06 07 08 09 0A 0B (YM2151 channels 0-7)
   00 01 02 03 04 05 08 0A ...
   ```
-- **Mapping**: Values 0x04-0x0B map to POKEY channels + variants
+- **Mapping**: 0x00-0x03 = POKEY channels 0-3; 0x04-0x0B = YM2151 channels 0-7
 
 #### Table 8: SFX Sequence Pointers (Primary)
 - **Address**: 0x6190
 - **Size**: ~400 bytes (200 entries × 2 bytes)
 - **Format**: 16-bit addresses (little-endian)
-- **Purpose**: Pointers to POKEY sound sequence data
+- **Purpose**: Pointers to sound sequence data (POKEY + YM2151)
 - **Used by**: handler_type_7 (0x45BA)
 - **Content Sample**:
   ```

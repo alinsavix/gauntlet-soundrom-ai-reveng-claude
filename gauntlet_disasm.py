@@ -32,10 +32,13 @@ Usage:
 
 import argparse
 import csv
+import math
 import os
 import struct
 import sys
 import wave
+
+import numpy as np
 
 # ── ROM Layout ────────────────────────────────────────────────────────────────
 
@@ -543,6 +546,11 @@ class POKEYEmulator:
         self.poly5 = self._init_poly4_5(5)
         self.poly9 = self._init_poly9_17(9)
         self.poly17 = None  # lazy init (512KB)
+        # Pre-compute LSB bit tuples for polynomial tables (tuples for fast scalar access)
+        self.poly4_bits = tuple(x & 1 for x in self.poly4)
+        self.poly5_bits = tuple(x & 1 for x in self.poly5)
+        self.poly9_bits = tuple(x & 1 for x in self.poly9)
+        self.poly17_bits = None  # lazy init
         self.reset()
 
     def reset(self):
@@ -604,6 +612,7 @@ class POKEYEmulator:
         """Lazy-init poly17 table (131071 entries)."""
         if self.poly17 is None:
             self.poly17 = self._init_poly9_17(17)
+            self.poly17_bits = tuple(x & 1 for x in self.poly17)
 
     def write(self, addr, data):
         """Write to POKEY register (address 0x00-0x0F)."""
@@ -789,28 +798,288 @@ class POKEYEmulator:
         """Generate num_samples PCM samples at given sample rate.
 
         Internally runs at 1.789790 MHz and downsamples by averaging.
-        Returns list of int16 values.
+        Returns numpy array of shape (num_samples,) dtype int16.
+
+        All hot-path methods are inlined for speed — no per-clock method calls.
         """
         self._ensure_poly17()
-        samples = []
+
+        # Cache ALL instance state as locals to avoid attribute lookups
+        p4 = self.p4
+        p5 = self.p5
+        p9 = self.p9
+        p17 = self.p17
+        poly4_bits = self.poly4_bits
+        poly5_bits = self.poly5_bits
+        poly9_bits = self.poly9_bits
+        poly17_bits = self.poly17_bits
+        ch_counter = list(self.ch_counter)
+        ch_AUDF = list(self.ch_AUDF)
+        ch_AUDC = list(self.ch_AUDC)
+        ch_output = list(self.ch_output)
+        ch_filter_sample = list(self.ch_filter_sample)
+        ch_borrow_cnt = list(self.ch_borrow_cnt)
+        clock_cnt = list(self.clock_cnt)
+        AUDCTL = self.AUDCTL
+        SKCTL = self.SKCTL
+        out_raw = self.out_raw
+        old_raw_inval = self.old_raw_inval
+        gain = self.DEFAULT_GAIN
+
+        # Bit constants (cached as locals)
+        NOTPOLY5 = 0x80
+        POLY4 = 0x40
+        PURE = 0x20
+        VOLUME_ONLY = 0x10
+        VOLUME_MASK = 0x0F
+        _POLY9 = 0x80
+        CH1_HICLK = 0x40
+        CH3_HICLK = 0x20
+        CH12_JOINED = 0x10
+        CH34_JOINED = 0x08
+        CH1_FILTER = 0x04
+        CH2_FILTER = 0x02
+        CLK_15KHZ = 0x01
+        DIV_64 = 28
+        DIV_15 = 114
+
+        in_reset = not (SKCTL & 0x03)
+        base_clock_is_114 = bool(AUDCTL & CLK_15KHZ)
+
+        samples = np.empty(num_samples, dtype=np.int16)
         clocks_per_sample = self.FREQ_17_EXACT / sample_rate
         clock_accum = 0.0
 
-        for _ in range(num_samples):
+        for i in range(num_samples):
             clock_accum += clocks_per_sample
             clocks_this = int(clock_accum)
             clock_accum -= clocks_this
-
-            # Accumulate for averaging
             total = 0
+
+            if in_reset:
+                # Chip in reset — output silence
+                vol = ((out_raw & 0xF) + ((out_raw >> 4) & 0xF) +
+                       ((out_raw >> 8) & 0xF) + ((out_raw >> 12) & 0xF))
+                samples[i] = max(-32768, min(32767, vol * gain))
+                continue
+
             for _ in range(clocks_this):
-                self._step_one_clock()
-                total += self._get_sample()
+                # --- inlined _step_one_clock ---
+
+                # Advance polynomial counters
+                p4 = p4 + 1
+                if p4 >= 15:
+                    p4 = 0
+                p5 = p5 + 1
+                if p5 >= 31:
+                    p5 = 0
+                p9 = p9 + 1
+                if p9 >= 511:
+                    p9 = 0
+                p17 = p17 + 1
+                if p17 >= 131071:
+                    p17 = 0
+
+                # Prescaler clocks
+                clk1 = True
+                clock_cnt[1] += 1
+                if clock_cnt[1] >= DIV_64:
+                    clock_cnt[1] = 0
+                    clk28 = True
+                else:
+                    clk28 = False
+                clock_cnt[2] += 1
+                if clock_cnt[2] >= DIV_15:
+                    clock_cnt[2] = 0
+                    clk114 = True
+                else:
+                    clk114 = False
+
+                base_clk = clk114 if base_clock_is_114 else clk28
+
+                # Channel 1 clocking
+                if (AUDCTL & CH1_HICLK) and clk1:
+                    borrow = 7 if (AUDCTL & CH12_JOINED) else 4
+                    ch_counter[0] = (ch_counter[0] + 1) & 0xFF
+                    if ch_counter[0] == 0 and ch_borrow_cnt[0] == 0:
+                        ch_borrow_cnt[0] = borrow
+                if not (AUDCTL & CH1_HICLK) and base_clk:
+                    ch_counter[0] = (ch_counter[0] + 1) & 0xFF
+                    if ch_counter[0] == 0 and ch_borrow_cnt[0] == 0:
+                        ch_borrow_cnt[0] = 1
+
+                # Channel 3 clocking
+                if (AUDCTL & CH3_HICLK) and clk1:
+                    borrow = 7 if (AUDCTL & CH34_JOINED) else 4
+                    ch_counter[2] = (ch_counter[2] + 1) & 0xFF
+                    if ch_counter[2] == 0 and ch_borrow_cnt[2] == 0:
+                        ch_borrow_cnt[2] = borrow
+                if not (AUDCTL & CH3_HICLK) and base_clk:
+                    ch_counter[2] = (ch_counter[2] + 1) & 0xFF
+                    if ch_counter[2] == 0 and ch_borrow_cnt[2] == 0:
+                        ch_borrow_cnt[2] = 1
+
+                # Channels 2 and 4 at base clock
+                if base_clk:
+                    if not (AUDCTL & CH12_JOINED):
+                        ch_counter[1] = (ch_counter[1] + 1) & 0xFF
+                        if ch_counter[1] == 0 and ch_borrow_cnt[1] == 0:
+                            ch_borrow_cnt[1] = 1
+                    if not (AUDCTL & CH34_JOINED):
+                        ch_counter[3] = (ch_counter[3] + 1) & 0xFF
+                        if ch_counter[3] == 0 and ch_borrow_cnt[3] == 0:
+                            ch_borrow_cnt[3] = 1
+
+                # Check borrows - Channel 3
+                if ch_borrow_cnt[2] > 0:
+                    ch_borrow_cnt[2] -= 1
+                    if ch_borrow_cnt[2] == 0:
+                        if AUDCTL & CH34_JOINED:
+                            ch_counter[3] = (ch_counter[3] + 1) & 0xFF
+                            if ch_counter[3] == 0 and ch_borrow_cnt[3] == 0:
+                                ch_borrow_cnt[3] = 1
+                        else:
+                            ch_counter[2] = ch_AUDF[2] ^ 0xFF
+                            ch_borrow_cnt[2] = 0
+                        # inlined _process_channel(2)
+                        audc = ch_AUDC[2]
+                        if (audc & NOTPOLY5) or poly5_bits[p5]:
+                            if audc & PURE:
+                                ch_output[2] ^= 1
+                            elif audc & POLY4:
+                                ch_output[2] = poly4_bits[p4]
+                            elif AUDCTL & _POLY9:
+                                ch_output[2] = poly9_bits[p9]
+                            else:
+                                ch_output[2] = poly17_bits[p17]
+                            old_raw_inval = True
+                        if AUDCTL & CH1_FILTER:
+                            ch_filter_sample[0] = ch_output[0]
+                        else:
+                            ch_filter_sample[0] = 1
+                        old_raw_inval = True
+
+                # Check borrows - Channel 4
+                if ch_borrow_cnt[3] > 0:
+                    ch_borrow_cnt[3] -= 1
+                    if ch_borrow_cnt[3] == 0:
+                        if AUDCTL & CH34_JOINED:
+                            ch_counter[2] = ch_AUDF[2] ^ 0xFF
+                            ch_borrow_cnt[2] = 0
+                        ch_counter[3] = ch_AUDF[3] ^ 0xFF
+                        ch_borrow_cnt[3] = 0
+                        # inlined _process_channel(3)
+                        audc = ch_AUDC[3]
+                        if (audc & NOTPOLY5) or poly5_bits[p5]:
+                            if audc & PURE:
+                                ch_output[3] ^= 1
+                            elif audc & POLY4:
+                                ch_output[3] = poly4_bits[p4]
+                            elif AUDCTL & _POLY9:
+                                ch_output[3] = poly9_bits[p9]
+                            else:
+                                ch_output[3] = poly17_bits[p17]
+                            old_raw_inval = True
+                        if AUDCTL & CH2_FILTER:
+                            ch_filter_sample[1] = ch_output[1]
+                        else:
+                            ch_filter_sample[1] = 1
+                        old_raw_inval = True
+
+                # Check borrows - Channel 1
+                if ch_borrow_cnt[0] > 0:
+                    ch_borrow_cnt[0] -= 1
+                    if ch_borrow_cnt[0] == 0:
+                        if AUDCTL & CH12_JOINED:
+                            ch_counter[1] = (ch_counter[1] + 1) & 0xFF
+                            if ch_counter[1] == 0 and ch_borrow_cnt[1] == 0:
+                                ch_borrow_cnt[1] = 1
+                        else:
+                            ch_counter[0] = ch_AUDF[0] ^ 0xFF
+                            ch_borrow_cnt[0] = 0
+                        # inlined _process_channel(0)
+                        audc = ch_AUDC[0]
+                        if (audc & NOTPOLY5) or poly5_bits[p5]:
+                            if audc & PURE:
+                                ch_output[0] ^= 1
+                            elif audc & POLY4:
+                                ch_output[0] = poly4_bits[p4]
+                            elif AUDCTL & _POLY9:
+                                ch_output[0] = poly9_bits[p9]
+                            else:
+                                ch_output[0] = poly17_bits[p17]
+                            old_raw_inval = True
+
+                # Check borrows - Channel 2
+                if ch_borrow_cnt[1] > 0:
+                    ch_borrow_cnt[1] -= 1
+                    if ch_borrow_cnt[1] == 0:
+                        if AUDCTL & CH12_JOINED:
+                            ch_counter[0] = ch_AUDF[0] ^ 0xFF
+                            ch_borrow_cnt[0] = 0
+                        ch_counter[1] = ch_AUDF[1] ^ 0xFF
+                        ch_borrow_cnt[1] = 0
+                        # inlined _process_channel(1)
+                        audc = ch_AUDC[1]
+                        if (audc & NOTPOLY5) or poly5_bits[p5]:
+                            if audc & PURE:
+                                ch_output[1] ^= 1
+                            elif audc & POLY4:
+                                ch_output[1] = poly4_bits[p4]
+                            elif AUDCTL & _POLY9:
+                                ch_output[1] = poly9_bits[p9]
+                            else:
+                                ch_output[1] = poly17_bits[p17]
+                            old_raw_inval = True
+
+                # Update raw output
+                if old_raw_inval:
+                    raw = 0
+                    for ch in range(4):
+                        audible = ((ch_output[ch] ^ ch_filter_sample[ch]) or
+                                   (ch_AUDC[ch] & VOLUME_ONLY))
+                        if audible:
+                            raw |= (ch_AUDC[ch] & VOLUME_MASK) << (ch * 4)
+                    out_raw = raw
+                    old_raw_inval = False
+
+                # --- inlined _get_sample ---
+                vol = ((out_raw & 0xF) + ((out_raw >> 4) & 0xF) +
+                       ((out_raw >> 8) & 0xF) + ((out_raw >> 12) & 0xF))
+                total += vol * gain
 
             if clocks_this > 0:
-                samples.append(max(-32768, min(32767, total // clocks_this)))
+                s = total // clocks_this
+                if s > 32767:
+                    s = 32767
+                elif s < -32768:
+                    s = -32768
+                samples[i] = s
             else:
-                samples.append(self._get_sample())
+                vol = ((out_raw & 0xF) + ((out_raw >> 4) & 0xF) +
+                       ((out_raw >> 8) & 0xF) + ((out_raw >> 12) & 0xF))
+                s = vol * gain
+                if s > 32767:
+                    s = 32767
+                elif s < -32768:
+                    s = -32768
+                samples[i] = s
+
+        # Write back state
+        self.p4 = p4
+        self.p5 = p5
+        self.p9 = p9
+        self.p17 = p17
+        self.ch_counter = ch_counter
+        self.ch_AUDF = ch_AUDF
+        self.ch_AUDC = ch_AUDC
+        self.ch_output = ch_output
+        self.ch_filter_sample = ch_filter_sample
+        self.ch_borrow_cnt = ch_borrow_cnt
+        self.clock_cnt = clock_cnt
+        self.AUDCTL = AUDCTL
+        self.out_raw = out_raw
+        self.old_raw_inval = old_raw_inval
 
         return samples
 
@@ -836,43 +1105,35 @@ class YM2151Emulator:
 
     @classmethod
     def _init_tables(cls):
-        """One-time init of shared lookup tables."""
+        """One-time init of shared lookup tables as numpy arrays."""
         if cls._sin_table is not None:
             return
-        import math
         # Linear sine table (0..1.0 range, 1024 entries)
-        cls._sin_table = [math.sin(2.0 * math.pi * i / 1024.0)
-                          for i in range(1024)]
+        cls._sin_table = np.sin(2.0 * np.pi * np.arange(1024) / 1024.0)
         # Envelope rate table: maps (rate, counter_step) to increment
-        # Simplified from OPM documentation
-        cls._eg_rate_table = []
-        for r in range(64):
-            if r < 2:
-                cls._eg_rate_table.append(0)
-            elif r < 60:
-                cls._eg_rate_table.append(r)
-            else:
-                cls._eg_rate_table.append(63)
+        eg_rate = np.arange(64, dtype=np.int32)
+        eg_rate[:2] = 0
+        eg_rate[60:] = 63
+        cls._eg_rate_table = eg_rate
         # EG shift table for timing
-        cls._eg_shift_table = []
-        for r in range(64):
-            if r < 2:
-                cls._eg_shift_table.append(11)
-            elif r >= 60:
-                cls._eg_shift_table.append(0)
-            else:
-                cls._eg_shift_table.append(max(0, 11 - (r >> 2)))
+        eg_shift = np.maximum(0, 11 - (np.arange(64, dtype=np.int32) >> 2))
+        eg_shift[:2] = 11
+        eg_shift[60:] = 0
+        cls._eg_shift_table = eg_shift
         # DT1 detune table (4 levels x 32 key codes)
-        cls._dt1_table = [[0]*32 for _ in range(4)]
-        dt1_values = [
+        cls._dt1_table = np.array([
             [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],
             [0,0,0,0,1,1,1,1,1,1,1,1,2,2,2,2,2,3,3,3,4,4,4,5,5,6,6,7,8,8,8,8],
             [1,1,1,1,2,2,2,2,2,3,3,3,4,4,4,5,5,6,6,7,8,8,9,10,11,12,13,14,16,16,16,16],
             [2,2,2,2,2,3,3,3,4,4,4,5,5,6,6,7,8,8,9,10,11,12,13,14,16,17,19,20,22,22,22,22],
-        ]
-        for d in range(4):
-            for k in range(32):
-                cls._dt1_table[d][k] = dt1_values[d][k]
+        ], dtype=np.float64)
+        # Pre-compute NOTE_FREQ as numpy array
+        cls._NOTE_FREQ_ARR = np.array(cls._NOTE_FREQ, dtype=np.float64)
+        # Pre-compute attenuation lookup table (0..96 dB in 0.1 dB steps)
+        # Index = int(atten_db * 10), max 960. Avoids 10**(-x/20) per operator.
+        atten_idx = np.arange(961, dtype=np.float64) / 10.0
+        cls._atten_table = np.power(10.0, -atten_idx / 20.0)
+        cls._atten_table = np.append(cls._atten_table, 0.0)  # sentinel for >96dB
 
     # Note frequency table: KC (key code) to phase increment
     # KC = (octave << 4) | note, note 0-15 (but only 0,1,2,4,5,6,8,9,10,12,13,14 valid)
@@ -890,41 +1151,41 @@ class YM2151Emulator:
 
     def reset(self):
         """Initialize all state."""
-        # Per-operator state (32 ops = 8 channels * 4 ops)
-        self.op_tl = [0] * 32      # Total Level (0-127)
-        self.op_ar = [0] * 32      # Attack Rate
-        self.op_d1r = [0] * 32     # Decay 1 Rate
-        self.op_d2r = [0] * 32     # Decay 2 Rate
-        self.op_rr = [0] * 32      # Release Rate
-        self.op_d1l = [0] * 32     # Decay 1 Level
-        self.op_ks = [0] * 32      # Key Scale
-        self.op_mul = [0] * 32     # Multiply
-        self.op_dt1 = [0] * 32     # Detune 1
-        self.op_dt2 = [0] * 32     # Detune 2
-        self.op_ams_en = [0] * 32  # AMS enable
+        # Per-operator state (32 ops = 8 channels * 4 ops) — numpy arrays
+        self.op_tl = np.zeros(32, dtype=np.float64)       # Total Level (0-127)
+        self.op_ar = np.zeros(32, dtype=np.int32)          # Attack Rate
+        self.op_d1r = np.zeros(32, dtype=np.int32)         # Decay 1 Rate
+        self.op_d2r = np.zeros(32, dtype=np.int32)         # Decay 2 Rate
+        self.op_rr = np.zeros(32, dtype=np.int32)          # Release Rate
+        self.op_d1l = np.zeros(32, dtype=np.int32)         # Decay 1 Level
+        self.op_ks = np.zeros(32, dtype=np.int32)          # Key Scale
+        self.op_mul = np.zeros(32, dtype=np.int32)         # Multiply
+        self.op_dt1 = np.zeros(32, dtype=np.int32)         # Detune 1
+        self.op_dt2 = np.zeros(32, dtype=np.int32)         # Detune 2
+        self.op_ams_en = np.zeros(32, dtype=np.int32)      # AMS enable
 
-        # Envelope state
-        self.op_eg_phase = [3] * 32     # 0=atk,1=dec1,2=dec2,3=rel
-        self.op_eg_level = [1023] * 32  # 10-bit (0=max vol, 1023=silent)
-        self.op_eg_counter = [0] * 32
+        # Envelope state — numpy arrays
+        self.op_eg_phase = np.full(32, 3, dtype=np.int32)     # 0=atk,1=dec1,2=dec2,3=rel
+        self.op_eg_level = np.full(32, 1023, dtype=np.int32)  # 10-bit (0=max vol, 1023=silent)
+        self.op_eg_counter = np.zeros(32, dtype=np.int32)
 
-        # Phase accumulators
-        self.op_phase = [0] * 32
+        # Phase accumulators — numpy array
+        self.op_phase = np.zeros(32, dtype=np.float64)
 
-        # Per-channel state
-        self.ch_kc = [0] * 8       # Key Code (octave + note)
-        self.ch_kf = [0] * 8       # Key Fraction
-        self.ch_fb = [0] * 8       # Feedback level (0-7)
-        self.ch_con = [0] * 8      # Connection algorithm (0-7)
-        self.ch_lr = [3] * 8       # L/R enable (bits: D7=R, D6=L -> stored as 0-3)
-        self.ch_pms = [0] * 8      # PMS
-        self.ch_ams = [0] * 8      # AMS
+        # Per-channel state — numpy arrays
+        self.ch_kc = np.zeros(8, dtype=np.int32)       # Key Code (octave + note)
+        self.ch_kf = np.zeros(8, dtype=np.int32)       # Key Fraction
+        self.ch_fb = np.zeros(8, dtype=np.int32)       # Feedback level (0-7)
+        self.ch_con = np.zeros(8, dtype=np.int32)      # Connection algorithm (0-7)
+        self.ch_lr = np.full(8, 3, dtype=np.int32)     # L/R enable (bits: D7=R, D6=L -> stored as 0-3)
+        self.ch_pms = np.zeros(8, dtype=np.int32)      # PMS
+        self.ch_ams = np.zeros(8, dtype=np.int32)      # AMS
 
         # Feedback memory (2 previous outputs per channel)
-        self.ch_fb_out = [[0, 0] for _ in range(8)]
+        self.ch_fb_out = np.zeros((8, 2), dtype=np.float64)
 
         # Key-on state per operator
-        self.op_key_on = [False] * 32
+        self.op_key_on = np.zeros(32, dtype=np.bool_)
 
         # LFO state
         self.lfo_freq = 0
@@ -1032,288 +1293,400 @@ class YM2151Emulator:
         remap = [0, 2, 1, 3]
         return ch + remap[slot_group] * 8
 
-    def _calc_phase_inc(self, ch, op_idx):
-        """Calculate phase increment for an operator."""
-        import math
-        kc = self.ch_kc[ch]
-        kf = self.ch_kf[ch]
-        octave = (kc >> 4) & 0x07
-        note = kc & 0x0F
+    def _calc_phase_incs_all(self):
+        """Calculate phase increments for all 32 operators (vectorized).
 
-        # Base frequency from note table
-        if note < 16:
-            base_freq = self._NOTE_FREQ[note]
-        else:
-            base_freq = self._NOTE_FREQ[0]
+        Returns numpy array of shape (32,) with phase increments.
+        """
+        # Each operator belongs to a channel (op_idx % 8)
+        ch_indices = np.arange(32, dtype=np.int32) % 8
+        kc = self.ch_kc[ch_indices]       # (32,)
+        kf = self.ch_kf[ch_indices]       # (32,)
+        octave = (kc >> 4) & 0x07         # (32,)
+        note = kc & 0x0F                  # (32,)
 
-        freq = base_freq * (1 << octave)
+        # Base frequency from note table (clamp note to 0-15)
+        base_freq = self._NOTE_FREQ_ARR[np.minimum(note, 15)]
+        freq = base_freq * (1 << octave).astype(np.float64)
 
-        # Key fraction (6 bits = 64 steps per semitone)
-        freq *= 2.0 ** (kf / (64.0 * 12.0))
+        # Key fraction
+        freq *= np.power(2.0, kf / (64.0 * 12.0))
 
         # Multiply
-        mul = self.op_mul[op_idx]
-        if mul == 0:
-            freq *= 0.5
-        else:
-            freq *= mul
+        mul = self.op_mul.astype(np.float64)
+        freq *= np.where(mul == 0, 0.5, mul)
 
         # DT1 detune
-        dt1 = self.op_dt1[op_idx]
-        dt1_sign = 1 if dt1 < 4 else -1
+        dt1 = self.op_dt1                 # (32,) int32
+        dt1_sign = np.where(dt1 < 4, 1.0, -1.0)
         dt1_idx = dt1 & 3
-        kc_idx = min(31, kc >> 1)
-        if dt1_idx > 0:
-            freq += dt1_sign * self._dt1_table[dt1_idx][kc_idx] * freq / 1024.0
+        kc_idx = np.minimum(31, kc >> 1)
+        # Fancy index into dt1_table (4x32)
+        dt1_val = self._dt1_table[dt1_idx, kc_idx]
+        has_dt1 = (dt1_idx > 0)
+        freq += np.where(has_dt1, dt1_sign * dt1_val * freq / 1024.0, 0.0)
 
         # DT2 coarse detune
-        dt2 = self.op_dt2[op_idx]
-        dt2_cents = [0, 600, 781, 950][dt2]  # in cents
-        if dt2_cents:
-            freq *= 2.0 ** (dt2_cents / 1200.0)
+        dt2 = self.op_dt2                 # (32,) int32
+        dt2_cents_arr = np.array([0.0, 600.0, 781.0, 950.0])
+        dt2_cents = dt2_cents_arr[dt2]
+        has_dt2 = (dt2_cents > 0)
+        freq *= np.where(has_dt2, np.power(2.0, dt2_cents / 1200.0), 1.0)
 
-        # Phase increment: freq / native_rate * 1024 (table size)
+        # Phase increment: freq / native_rate * 1024
         return freq / self.RATE * 1024.0
-
-    def _advance_eg(self, op_idx):
-        """Advance envelope generator for one operator.
-
-        Uses an exponential attack curve and linear decay/release.
-        The EG counter is divided by a rate-dependent period to control speed.
-        """
-        phase = self.op_eg_phase[op_idx]
-        level = self.op_eg_level[op_idx]
-        counter = self.op_eg_counter[op_idx]
-
-        if phase == 0:  # Attack (exponential: fast at high level, slow near 0)
-            rate = self.op_ar[op_idx]
-            if rate == 0:
-                return
-            eff_rate = min(63, rate * 2 + (self.ch_kc[op_idx % 8] >> (3 - self.op_ks[op_idx])) if self.op_ks[op_idx] else rate * 2)
-            eff_rate = min(63, eff_rate)
-            # Period between EG steps: lower eff_rate = longer period
-            if eff_rate >= 62:
-                # Instant attack
-                level = 0
-                self.op_eg_phase[op_idx] = 1
-            else:
-                period = max(1, 1 << max(0, 8 - (eff_rate >> 2)))
-                counter += 1
-                if counter >= period:
-                    counter = 0
-                    # Exponential attack: step proportional to remaining level
-                    step = max(1, level >> max(0, 3 - (eff_rate & 3)))
-                    level -= step
-                    if level <= 0:
-                        level = 0
-                        self.op_eg_phase[op_idx] = 1
-        elif phase == 1:  # Decay 1 (linear toward D1L)
-            rate = self.op_d1r[op_idx]
-            if rate == 0:
-                self.op_eg_level[op_idx] = level
-                self.op_eg_counter[op_idx] = counter
-                return
-            eff_rate = min(63, rate * 2 + (self.op_ks[op_idx] >> 1))
-            period = max(1, 1 << max(0, 8 - (eff_rate >> 2)))
-            counter += 1
-            if counter >= period:
-                counter = 0
-                step = 1 + (eff_rate & 3)
-                level += step
-                d1l = self.op_d1l[op_idx]
-                target = d1l << 5 if d1l < 15 else 1023
-                if level >= target:
-                    level = target
-                    self.op_eg_phase[op_idx] = 2
-        elif phase == 2:  # Decay 2 / Sustain (linear toward silence)
-            rate = self.op_d2r[op_idx]
-            if rate == 0:
-                self.op_eg_level[op_idx] = level
-                self.op_eg_counter[op_idx] = counter
-                return
-            eff_rate = min(63, rate * 2 + (self.op_ks[op_idx] >> 1))
-            period = max(1, 1 << max(0, 8 - (eff_rate >> 2)))
-            counter += 1
-            if counter >= period:
-                counter = 0
-                level = min(1023, level + 1 + (eff_rate & 3))
-        elif phase == 3:  # Release (linear, faster)
-            rate = self.op_rr[op_idx]
-            eff_rate = min(63, rate * 4 + 2 + (self.op_ks[op_idx] >> 1))
-            period = max(1, 1 << max(0, 6 - (eff_rate >> 2)))
-            counter += 1
-            if counter >= period:
-                counter = 0
-                level = min(1023, level + 2 + (eff_rate & 3))
-
-        self.op_eg_level[op_idx] = level
-        self.op_eg_counter[op_idx] = counter
-
-    def _calc_op(self, op_idx, phase_inc, modulation):
-        """Calculate one operator output sample."""
-        # Advance phase
-        self.op_phase[op_idx] = (self.op_phase[op_idx] + phase_inc) % 1024.0
-
-        # Phase with modulation
-        phase = (self.op_phase[op_idx] + modulation) % 1024.0
-        idx = int(phase) & 1023
-
-        # Sine lookup
-        out = self._sin_table[idx]
-
-        # Apply envelope (TL + EG level)
-        # TL is 0-127 (0=max), EG is 0-1023 (0=max)
-        tl = self.op_tl[op_idx]
-        eg = self.op_eg_level[op_idx]
-        # Convert to attenuation: each TL unit = 0.75dB, each EG unit ~0.09375dB
-        atten_db = tl * 0.75 + eg * (48.0 / 1024.0)
-        if atten_db > 96:
-            return 0.0
-        import math
-        atten = math.pow(10.0, -atten_db / 20.0)
-        return out * atten
-
-    def _calc_channel(self, ch):
-        """Calculate one channel output using the connection algorithm."""
-        con = self.ch_con[ch]
-        fb = self.ch_fb[ch]
-
-        # Operator indices: M1, M2, C1, C2
-        m1 = ch + 0 * 8
-        m2 = ch + 1 * 8
-        c1 = ch + 2 * 8
-        c2 = ch + 3 * 8
-
-        # Phase increments
-        m1_inc = self._calc_phase_inc(ch, m1)
-        m2_inc = self._calc_phase_inc(ch, m2)
-        c1_inc = self._calc_phase_inc(ch, c1)
-        c2_inc = self._calc_phase_inc(ch, c2)
-
-        # Feedback for M1
-        if fb > 0:
-            fb_mod = (self.ch_fb_out[ch][0] + self.ch_fb_out[ch][1]) / 2.0
-            fb_mod *= (1 << (fb - 1)) / 4.0  # scale feedback
-        else:
-            fb_mod = 0.0
-
-        m1_out = self._calc_op(m1, m1_inc, fb_mod)
-        self.ch_fb_out[ch][1] = self.ch_fb_out[ch][0]
-        self.ch_fb_out[ch][0] = m1_out * 512.0  # scale for feedback
-
-        # Connection algorithms (from YM2151 documentation)
-        # Phase modulation is scaled by 512
-        if con == 0:
-            # M1->C1->M2->C2
-            c1_out = self._calc_op(c1, c1_inc, m1_out * 512)
-            m2_out = self._calc_op(m2, m2_inc, c1_out * 512)
-            c2_out = self._calc_op(c2, c2_inc, m2_out * 512)
-            out = c2_out
-        elif con == 1:
-            # (M1+C1)->M2->C2
-            c1_out = self._calc_op(c1, c1_inc, 0)
-            m2_out = self._calc_op(m2, m2_inc, (m1_out + c1_out) * 256)
-            c2_out = self._calc_op(c2, c2_inc, m2_out * 512)
-            out = c2_out
-        elif con == 2:
-            # (M1+(C1->M2))->C2
-            c1_out = self._calc_op(c1, c1_inc, 0)
-            m2_out = self._calc_op(m2, m2_inc, c1_out * 512)
-            c2_out = self._calc_op(c2, c2_inc, (m1_out + m2_out) * 256)
-            out = c2_out
-        elif con == 3:
-            # ((M1->C1)+M2)->C2
-            c1_out = self._calc_op(c1, c1_inc, m1_out * 512)
-            m2_out = self._calc_op(m2, m2_inc, 0)
-            c2_out = self._calc_op(c2, c2_inc, (c1_out + m2_out) * 256)
-            out = c2_out
-        elif con == 4:
-            # (M1->C1)+(M2->C2)
-            c1_out = self._calc_op(c1, c1_inc, m1_out * 512)
-            m2_out = self._calc_op(m2, m2_inc, 0)
-            c2_out = self._calc_op(c2, c2_inc, m2_out * 512)
-            out = c1_out + c2_out
-        elif con == 5:
-            # M1->(C1+M2+C2)
-            c1_out = self._calc_op(c1, c1_inc, m1_out * 512)
-            m2_out = self._calc_op(m2, m2_inc, m1_out * 512)
-            c2_out = self._calc_op(c2, c2_inc, m1_out * 512)
-            out = c1_out + m2_out + c2_out
-        elif con == 6:
-            # M1->C1, M2, C2 (1 modulator + 3 carriers)
-            c1_out = self._calc_op(c1, c1_inc, m1_out * 512)
-            m2_out = self._calc_op(m2, m2_inc, 0)
-            c2_out = self._calc_op(c2, c2_inc, 0)
-            out = c1_out + m2_out + c2_out
-        else:  # con == 7
-            # M1+C1+M2+C2 (4 carriers, no modulation)
-            c1_out = self._calc_op(c1, c1_inc, 0)
-            m2_out = self._calc_op(m2, m2_inc, 0)
-            c2_out = self._calc_op(c2, c2_inc, 0)
-            out = m1_out + c1_out + m2_out + c2_out
-
-        return out
 
     def render(self, num_samples, sample_rate=44100):
         """Generate num_samples of stereo PCM at given rate.
 
-        Returns list of (left, right) int16 tuples.
+        Returns numpy array of shape (num_samples, 2) dtype int16.
         """
-        import math
-        output = []
         ratio = self.RATE / sample_rate
-        native_pos = 0.0
-        native_left = 0.0
-        native_right = 0.0
-        native_count = 0
-
         total_native = int(num_samples * ratio) + 2
-        for _ in range(total_native):
-            # Advance envelopes
-            self.eg_cnt += 1
-            for op in range(32):
-                self._advance_eg(op)
 
-            # Advance LFO
-            self.lfo_counter += 1
+        # Phase increments are constant during render() (no register changes)
+        phase_incs = self._calc_phase_incs_all().tolist()  # shape (32,)
 
-            # Mix all 8 channels
+        # Convert ALL state to Python lists for fast scalar access
+        # (numpy scalar indexing is ~10x slower than list indexing)
+        op_phase = self.op_phase.tolist()
+        op_tl = self.op_tl.tolist()
+        op_eg_level = self.op_eg_level.tolist()
+        op_eg_phase = self.op_eg_phase.tolist()
+        op_eg_counter = self.op_eg_counter.tolist()
+        op_ar = self.op_ar.tolist()
+        op_d1r = self.op_d1r.tolist()
+        op_d2r = self.op_d2r.tolist()
+        op_rr = self.op_rr.tolist()
+        op_d1l = self.op_d1l.tolist()
+        op_ks = self.op_ks.tolist()
+        ch_kc = self.ch_kc.tolist()
+        sin_table = self._sin_table.tolist()
+        atten_table = self._atten_table.tolist()
+        fb_out_0 = [float(self.ch_fb_out[i, 0]) for i in range(8)]
+        fb_out_1 = [float(self.ch_fb_out[i, 1]) for i in range(8)]
+
+        # Pre-compute channel configs as Python ints
+        ch_con = [int(self.ch_con[i]) for i in range(8)]
+        ch_fb = [int(self.ch_fb[i]) for i in range(8)]
+        lr_vals = [int(self.ch_lr[i]) for i in range(8)]
+
+        # Output buffers as Python lists (converted to numpy at end)
+        native_left = [0.0] * total_native
+        native_right = [0.0] * total_native
+
+        eg_cnt = int(self.eg_cnt)
+        lfo_counter = int(self.lfo_counter)
+
+        for n in range(total_native):
+            eg_cnt += 1
+            lfo_counter += 1
+
+            # --- Inlined _advance_eg_all: pure Python loop (no numpy) ---
+            for i in range(32):
+                p = op_eg_phase[i]
+                if p == 0:  # Attack
+                    rate = op_ar[i]
+                    if rate == 0:
+                        continue
+                    ks_val = op_ks[i]
+                    kc_val = ch_kc[i & 7]
+                    if ks_val > 0:
+                        eff = rate * 2 + (kc_val >> (3 - ks_val))
+                    else:
+                        eff = rate * 2
+                    if eff > 63:
+                        eff = 63
+                    if eff >= 62:
+                        op_eg_level[i] = 0
+                        op_eg_phase[i] = 1
+                        continue
+                    shift = 8 - (eff >> 2)
+                    period = (1 << shift) if shift > 0 else 1
+                    op_eg_counter[i] += 1
+                    if op_eg_counter[i] >= period:
+                        op_eg_counter[i] = 0
+                        shift2 = 3 - (eff & 3)
+                        lev = op_eg_level[i]
+                        step = (lev >> shift2) if shift2 > 0 else lev
+                        if step < 1:
+                            step = 1
+                        lev -= step
+                        if lev <= 0:
+                            op_eg_level[i] = 0
+                            op_eg_phase[i] = 1
+                        else:
+                            op_eg_level[i] = lev
+                elif p == 1:  # Decay 1
+                    rate = op_d1r[i]
+                    if rate == 0:
+                        continue
+                    eff = rate * 2 + (op_ks[i] >> 1)
+                    if eff > 63:
+                        eff = 63
+                    shift = 8 - (eff >> 2)
+                    period = (1 << shift) if shift > 0 else 1
+                    op_eg_counter[i] += 1
+                    if op_eg_counter[i] >= period:
+                        op_eg_counter[i] = 0
+                        lev = op_eg_level[i] + 1 + (eff & 3)
+                        d1l = op_d1l[i]
+                        target = (d1l << 5) if d1l < 15 else 1023
+                        if lev >= target:
+                            op_eg_level[i] = target
+                            op_eg_phase[i] = 2
+                        else:
+                            op_eg_level[i] = lev
+                elif p == 2:  # Decay 2 / Sustain
+                    rate = op_d2r[i]
+                    if rate == 0:
+                        continue
+                    eff = rate * 2 + (op_ks[i] >> 1)
+                    if eff > 63:
+                        eff = 63
+                    shift = 8 - (eff >> 2)
+                    period = (1 << shift) if shift > 0 else 1
+                    op_eg_counter[i] += 1
+                    if op_eg_counter[i] >= period:
+                        op_eg_counter[i] = 0
+                        lev = op_eg_level[i] + 1 + (eff & 3)
+                        if lev > 1023:
+                            lev = 1023
+                        op_eg_level[i] = lev
+                else:  # p == 3, Release
+                    rate = op_rr[i]
+                    eff = rate * 4 + 2 + (op_ks[i] >> 1)
+                    if eff > 63:
+                        eff = 63
+                    shift = 6 - (eff >> 2)
+                    period = (1 << shift) if shift > 0 else 1
+                    op_eg_counter[i] += 1
+                    if op_eg_counter[i] >= period:
+                        op_eg_counter[i] = 0
+                        lev = op_eg_level[i] + 2 + (eff & 3)
+                        if lev > 1023:
+                            lev = 1023
+                        op_eg_level[i] = lev
+
+            # --- Mix 8 channels (inlined operator calculations) ---
             left = 0.0
             right = 0.0
             for ch in range(8):
-                sample = self._calc_channel(ch)
-                lr = self.ch_lr[ch]
-                if lr & 2:  # left
-                    left += sample
-                if lr & 1:  # right
-                    right += sample
+                con = ch_con[ch]
+                fb = ch_fb[ch]
+                m1 = ch
+                m2 = ch + 8
+                c1 = ch + 16
+                c2 = ch + 24
 
-            # Accumulate for resampling
-            native_left += left
-            native_right += right
-            native_count += 1
-            native_pos += 1.0
+                # M1 with feedback
+                if fb > 0:
+                    fb_mod = (fb_out_0[ch] + fb_out_1[ch]) * 0.5 * ((1 << (fb - 1)) * 0.25)
+                else:
+                    fb_mod = 0.0
 
-            if native_pos >= ratio and native_count > 0:
-                avg_l = native_left / native_count
-                avg_r = native_right / native_count
-                # Scale to int16 range
-                sl = max(-32768, min(32767, int(avg_l * 24000)))
-                sr = max(-32768, min(32767, int(avg_r * 24000)))
-                output.append((sl, sr))
-                native_left = 0.0
-                native_right = 0.0
-                native_count = 0
-                native_pos -= ratio
+                op_phase[m1] = (op_phase[m1] + phase_incs[m1]) % 1024.0
+                pv = (op_phase[m1] + fb_mod) % 1024.0
+                m1_out = sin_table[int(pv) & 1023]
+                aidx = int((op_tl[m1] * 0.75 + op_eg_level[m1] * 0.046875) * 10.0)
+                if aidx > 960:
+                    m1_out = 0.0
+                else:
+                    m1_out *= atten_table[aidx]
 
-                if len(output) >= num_samples:
-                    break
+                fb_out_1[ch] = fb_out_0[ch]
+                fb_out_0[ch] = m1_out * 512.0
 
-        # Pad if needed
-        while len(output) < num_samples:
-            output.append((0, 0))
+                # Connection algorithm routing
+                if con == 0:
+                    # M1->C1->M2->C2
+                    op_phase[c1] = (op_phase[c1] + phase_incs[c1]) % 1024.0
+                    pv = (op_phase[c1] + m1_out * 512) % 1024.0
+                    c1_out = sin_table[int(pv) & 1023]
+                    aidx = int((op_tl[c1] * 0.75 + op_eg_level[c1] * 0.046875) * 10.0)
+                    c1_out = 0.0 if aidx > 960 else c1_out * atten_table[aidx]
 
-        return output
+                    op_phase[m2] = (op_phase[m2] + phase_incs[m2]) % 1024.0
+                    pv = (op_phase[m2] + c1_out * 512) % 1024.0
+                    m2_out = sin_table[int(pv) & 1023]
+                    aidx = int((op_tl[m2] * 0.75 + op_eg_level[m2] * 0.046875) * 10.0)
+                    m2_out = 0.0 if aidx > 960 else m2_out * atten_table[aidx]
+
+                    op_phase[c2] = (op_phase[c2] + phase_incs[c2]) % 1024.0
+                    pv = (op_phase[c2] + m2_out * 512) % 1024.0
+                    c2_out = sin_table[int(pv) & 1023]
+                    aidx = int((op_tl[c2] * 0.75 + op_eg_level[c2] * 0.046875) * 10.0)
+                    out = 0.0 if aidx > 960 else c2_out * atten_table[aidx]
+
+                elif con == 1:
+                    # (M1+C1)->M2->C2
+                    op_phase[c1] = (op_phase[c1] + phase_incs[c1]) % 1024.0
+                    c1_out = sin_table[int(op_phase[c1]) & 1023]
+                    aidx = int((op_tl[c1] * 0.75 + op_eg_level[c1] * 0.046875) * 10.0)
+                    c1_out = 0.0 if aidx > 960 else c1_out * atten_table[aidx]
+
+                    op_phase[m2] = (op_phase[m2] + phase_incs[m2]) % 1024.0
+                    pv = (op_phase[m2] + (m1_out + c1_out) * 256) % 1024.0
+                    m2_out = sin_table[int(pv) & 1023]
+                    aidx = int((op_tl[m2] * 0.75 + op_eg_level[m2] * 0.046875) * 10.0)
+                    m2_out = 0.0 if aidx > 960 else m2_out * atten_table[aidx]
+
+                    op_phase[c2] = (op_phase[c2] + phase_incs[c2]) % 1024.0
+                    pv = (op_phase[c2] + m2_out * 512) % 1024.0
+                    c2_out = sin_table[int(pv) & 1023]
+                    aidx = int((op_tl[c2] * 0.75 + op_eg_level[c2] * 0.046875) * 10.0)
+                    out = 0.0 if aidx > 960 else c2_out * atten_table[aidx]
+
+                elif con == 2:
+                    # (M1+(C1->M2))->C2
+                    op_phase[c1] = (op_phase[c1] + phase_incs[c1]) % 1024.0
+                    c1_out = sin_table[int(op_phase[c1]) & 1023]
+                    aidx = int((op_tl[c1] * 0.75 + op_eg_level[c1] * 0.046875) * 10.0)
+                    c1_out = 0.0 if aidx > 960 else c1_out * atten_table[aidx]
+
+                    op_phase[m2] = (op_phase[m2] + phase_incs[m2]) % 1024.0
+                    pv = (op_phase[m2] + c1_out * 512) % 1024.0
+                    m2_out = sin_table[int(pv) & 1023]
+                    aidx = int((op_tl[m2] * 0.75 + op_eg_level[m2] * 0.046875) * 10.0)
+                    m2_out = 0.0 if aidx > 960 else m2_out * atten_table[aidx]
+
+                    op_phase[c2] = (op_phase[c2] + phase_incs[c2]) % 1024.0
+                    pv = (op_phase[c2] + (m1_out + m2_out) * 256) % 1024.0
+                    c2_out = sin_table[int(pv) & 1023]
+                    aidx = int((op_tl[c2] * 0.75 + op_eg_level[c2] * 0.046875) * 10.0)
+                    out = 0.0 if aidx > 960 else c2_out * atten_table[aidx]
+
+                elif con == 3:
+                    # ((M1->C1)+M2)->C2
+                    op_phase[c1] = (op_phase[c1] + phase_incs[c1]) % 1024.0
+                    pv = (op_phase[c1] + m1_out * 512) % 1024.0
+                    c1_out = sin_table[int(pv) & 1023]
+                    aidx = int((op_tl[c1] * 0.75 + op_eg_level[c1] * 0.046875) * 10.0)
+                    c1_out = 0.0 if aidx > 960 else c1_out * atten_table[aidx]
+
+                    op_phase[m2] = (op_phase[m2] + phase_incs[m2]) % 1024.0
+                    m2_out = sin_table[int(op_phase[m2]) & 1023]
+                    aidx = int((op_tl[m2] * 0.75 + op_eg_level[m2] * 0.046875) * 10.0)
+                    m2_out = 0.0 if aidx > 960 else m2_out * atten_table[aidx]
+
+                    op_phase[c2] = (op_phase[c2] + phase_incs[c2]) % 1024.0
+                    pv = (op_phase[c2] + (c1_out + m2_out) * 256) % 1024.0
+                    c2_out = sin_table[int(pv) & 1023]
+                    aidx = int((op_tl[c2] * 0.75 + op_eg_level[c2] * 0.046875) * 10.0)
+                    out = 0.0 if aidx > 960 else c2_out * atten_table[aidx]
+
+                elif con == 4:
+                    # (M1->C1)+(M2->C2)
+                    op_phase[c1] = (op_phase[c1] + phase_incs[c1]) % 1024.0
+                    pv = (op_phase[c1] + m1_out * 512) % 1024.0
+                    c1_out = sin_table[int(pv) & 1023]
+                    aidx = int((op_tl[c1] * 0.75 + op_eg_level[c1] * 0.046875) * 10.0)
+                    c1_out = 0.0 if aidx > 960 else c1_out * atten_table[aidx]
+
+                    op_phase[m2] = (op_phase[m2] + phase_incs[m2]) % 1024.0
+                    m2_out = sin_table[int(op_phase[m2]) & 1023]
+                    aidx = int((op_tl[m2] * 0.75 + op_eg_level[m2] * 0.046875) * 10.0)
+                    m2_out = 0.0 if aidx > 960 else m2_out * atten_table[aidx]
+
+                    op_phase[c2] = (op_phase[c2] + phase_incs[c2]) % 1024.0
+                    pv = (op_phase[c2] + m2_out * 512) % 1024.0
+                    c2_out = sin_table[int(pv) & 1023]
+                    aidx = int((op_tl[c2] * 0.75 + op_eg_level[c2] * 0.046875) * 10.0)
+                    c2_out = 0.0 if aidx > 960 else c2_out * atten_table[aidx]
+                    out = c1_out + c2_out
+
+                elif con == 5:
+                    # M1->(C1+M2+C2)
+                    mod = m1_out * 512
+                    op_phase[c1] = (op_phase[c1] + phase_incs[c1]) % 1024.0
+                    pv = (op_phase[c1] + mod) % 1024.0
+                    c1_out = sin_table[int(pv) & 1023]
+                    aidx = int((op_tl[c1] * 0.75 + op_eg_level[c1] * 0.046875) * 10.0)
+                    c1_out = 0.0 if aidx > 960 else c1_out * atten_table[aidx]
+
+                    op_phase[m2] = (op_phase[m2] + phase_incs[m2]) % 1024.0
+                    pv = (op_phase[m2] + mod) % 1024.0
+                    m2_out = sin_table[int(pv) & 1023]
+                    aidx = int((op_tl[m2] * 0.75 + op_eg_level[m2] * 0.046875) * 10.0)
+                    m2_out = 0.0 if aidx > 960 else m2_out * atten_table[aidx]
+
+                    op_phase[c2] = (op_phase[c2] + phase_incs[c2]) % 1024.0
+                    pv = (op_phase[c2] + mod) % 1024.0
+                    c2_out = sin_table[int(pv) & 1023]
+                    aidx = int((op_tl[c2] * 0.75 + op_eg_level[c2] * 0.046875) * 10.0)
+                    c2_out = 0.0 if aidx > 960 else c2_out * atten_table[aidx]
+                    out = c1_out + m2_out + c2_out
+
+                elif con == 6:
+                    # M1->C1, M2, C2
+                    op_phase[c1] = (op_phase[c1] + phase_incs[c1]) % 1024.0
+                    pv = (op_phase[c1] + m1_out * 512) % 1024.0
+                    c1_out = sin_table[int(pv) & 1023]
+                    aidx = int((op_tl[c1] * 0.75 + op_eg_level[c1] * 0.046875) * 10.0)
+                    c1_out = 0.0 if aidx > 960 else c1_out * atten_table[aidx]
+
+                    op_phase[m2] = (op_phase[m2] + phase_incs[m2]) % 1024.0
+                    m2_out = sin_table[int(op_phase[m2]) & 1023]
+                    aidx = int((op_tl[m2] * 0.75 + op_eg_level[m2] * 0.046875) * 10.0)
+                    m2_out = 0.0 if aidx > 960 else m2_out * atten_table[aidx]
+
+                    op_phase[c2] = (op_phase[c2] + phase_incs[c2]) % 1024.0
+                    c2_out = sin_table[int(op_phase[c2]) & 1023]
+                    aidx = int((op_tl[c2] * 0.75 + op_eg_level[c2] * 0.046875) * 10.0)
+                    c2_out = 0.0 if aidx > 960 else c2_out * atten_table[aidx]
+                    out = c1_out + m2_out + c2_out
+
+                else:  # con == 7
+                    # M1+C1+M2+C2 (all carriers)
+                    op_phase[c1] = (op_phase[c1] + phase_incs[c1]) % 1024.0
+                    c1_out = sin_table[int(op_phase[c1]) & 1023]
+                    aidx = int((op_tl[c1] * 0.75 + op_eg_level[c1] * 0.046875) * 10.0)
+                    c1_out = 0.0 if aidx > 960 else c1_out * atten_table[aidx]
+
+                    op_phase[m2] = (op_phase[m2] + phase_incs[m2]) % 1024.0
+                    m2_out = sin_table[int(op_phase[m2]) & 1023]
+                    aidx = int((op_tl[m2] * 0.75 + op_eg_level[m2] * 0.046875) * 10.0)
+                    m2_out = 0.0 if aidx > 960 else m2_out * atten_table[aidx]
+
+                    op_phase[c2] = (op_phase[c2] + phase_incs[c2]) % 1024.0
+                    c2_out = sin_table[int(op_phase[c2]) & 1023]
+                    aidx = int((op_tl[c2] * 0.75 + op_eg_level[c2] * 0.046875) * 10.0)
+                    c2_out = 0.0 if aidx > 960 else c2_out * atten_table[aidx]
+                    out = m1_out + c1_out + m2_out + c2_out
+
+                lr_val = lr_vals[ch]
+                if lr_val & 2:
+                    left += out
+                if lr_val & 1:
+                    right += out
+
+            native_left[n] = left
+            native_right[n] = right
+
+        # Write back state from lists to numpy arrays
+        self.op_phase[:] = op_phase
+        self.op_eg_level[:] = op_eg_level
+        self.op_eg_phase[:] = op_eg_phase
+        self.op_eg_counter[:] = op_eg_counter
+        self.eg_cnt = eg_cnt
+        self.lfo_counter = lfo_counter
+        for i in range(8):
+            self.ch_fb_out[i, 0] = fb_out_0[i]
+            self.ch_fb_out[i, 1] = fb_out_1[i]
+
+        # Vectorized resampling from native rate to output rate
+        native_left_np = np.array(native_left, dtype=np.float64)
+        native_right_np = np.array(native_right, dtype=np.float64)
+        output_indices = np.arange(num_samples, dtype=np.float64) * ratio
+        native_indices = np.arange(total_native, dtype=np.float64)
+        out_left = np.interp(output_indices, native_indices, native_left_np)
+        out_right = np.interp(output_indices, native_indices, native_right_np)
+
+        # Scale and clamp to int16
+        out_left = np.clip(out_left * 24000, -32768, 32767).astype(np.int16)
+        out_right = np.clip(out_right * 24000, -32768, 32767).astype(np.int16)
+
+        return np.column_stack((out_left, out_right))
 
 
 # ── Sequence Interpreter (Bytecode Executor) ─────────────────────────────────
@@ -1336,8 +1709,8 @@ class SequenceInterpreter:
                          sample_rate=44100):
         """Execute a sequence and return rendered PCM samples.
 
-        For POKEY channels (channel_id >= 0x08): returns list of int16 (mono).
-        For YM2151 channels (channel_id <= 0x07): returns list of (L,R) int16.
+        For POKEY channels (channel_id <= 0x03): returns list of int16 (mono).
+        For YM2151 channels (channel_id >= 0x04): returns list of (L,R) int16.
 
         Args:
             start_addr: ROM address of sequence start
@@ -1345,7 +1718,7 @@ class SequenceInterpreter:
             max_seconds: Safety limit on output duration
             sample_rate: Output sample rate
         """
-        is_ym = channel_id <= 0x07
+        is_ym = channel_id >= 0x04
         hw_mode = "YM2151" if is_ym else "POKEY"
 
         # Collect timed events: list of (time_in_seconds, event_type, data)
@@ -1358,6 +1731,188 @@ class SequenceInterpreter:
             return self._render_pokey_events(events, max_seconds, sample_rate)
         else:
             return []
+
+    def _step_pokey_envelopes(self, env_state, base_audf, base_vol,
+                              distortion, pokey_ch_idx, start_frame,
+                              num_frames, events, stop_on_silence=False):
+        """Step POKEY envelopes for num_frames, emitting per-frame events.
+
+        env_state is a dict with keys:
+            freq_ptr, freq_pos, freq_frame_ctr, freq_delta, freq_accum,
+            freq_loop_count,
+            vol_ptr, vol_pos, vol_frame_ctr, vol_delta, vol_accum,
+            vol_loop_count
+        All values are mutated in place.
+
+        If stop_on_silence=True, returns early once effective volume has been
+        0 for several consecutive frames.  Returns actual frame count emitted.
+        """
+        rom = self.rom
+        fe = env_state
+        silent_frames = 0
+        MAX_SILENT = 4  # stop after 4 consecutive silent frames
+        actual_frames = 0
+
+        for frame in range(num_frames):
+            # --- Step frequency envelope ---
+            if fe['freq_active']:
+                fe['freq_frame_ctr'] -= 1
+                if fe['freq_frame_ctr'] <= 0:
+                    # Advance to next entry
+                    while True:
+                        pos = fe['freq_pos']
+                        try:
+                            count = rom.read_byte(fe['freq_ptr'] + pos)
+                        except (ValueError, IndexError):
+                            fe['freq_active'] = False
+                            break
+                        if count == 0xFF:
+                            # Loop/end marker
+                            lc_addr = fe['freq_ptr'] + pos + 1
+                            try:
+                                lc = rom.read_byte(lc_addr)
+                            except (ValueError, IndexError):
+                                fe['freq_pos'] = 0
+                                break
+                            if fe['freq_loop_count'] == -1:
+                                fe['freq_loop_count'] = lc
+                            if fe['freq_loop_count'] <= 0:
+                                fe['freq_pos'] = 0
+                                break
+                            fe['freq_loop_count'] -= 1
+                            if fe['freq_loop_count'] > 0:
+                                try:
+                                    back = rom.read_byte(lc_addr + 1)
+                                except (ValueError, IndexError):
+                                    fe['freq_pos'] = 0
+                                    break
+                                fe['freq_pos'] = max(0, pos - back)
+                                continue
+                            else:
+                                fe['freq_pos'] = pos + 3
+                                continue
+                        if count == 0:
+                            fe['freq_active'] = False
+                            break
+                        try:
+                            lo = rom.read_byte(fe['freq_ptr'] + pos + 1)
+                            hi = rom.read_byte(fe['freq_ptr'] + pos + 2)
+                        except (ValueError, IndexError):
+                            fe['freq_active'] = False
+                            break
+                        delta = (hi << 8) | lo
+                        if delta >= 0x8000:
+                            delta -= 0x10000
+                        fe['freq_delta'] = delta << 3
+                        fe['freq_frame_ctr'] = count
+                        fe['freq_pos'] = pos + 3
+                        break
+
+                if fe['freq_active']:
+                    fe['freq_accum'] += fe['freq_delta']
+                    # Clamp to 24-bit signed range
+                    if fe['freq_accum'] > 0x7FFFFF:
+                        fe['freq_accum'] = 0x7FFFFF
+                    elif fe['freq_accum'] < -0x800000:
+                        fe['freq_accum'] = -0x800000
+
+            # --- Step volume envelope ---
+            if fe['vol_active']:
+                fe['vol_frame_ctr'] -= 1
+                if fe['vol_frame_ctr'] <= 0:
+                    while True:
+                        pos = fe['vol_pos']
+                        try:
+                            count = rom.read_byte(fe['vol_ptr'] + pos)
+                        except (ValueError, IndexError):
+                            fe['vol_active'] = False
+                            break
+                        if count == 0xFF:
+                            lc_addr = fe['vol_ptr'] + pos + 1
+                            try:
+                                lc = rom.read_byte(lc_addr)
+                            except (ValueError, IndexError):
+                                fe['vol_pos'] = 0
+                                break
+                            if fe['vol_loop_count'] == -1:
+                                fe['vol_loop_count'] = lc
+                            if fe['vol_loop_count'] <= 0:
+                                fe['vol_pos'] = 0
+                                break
+                            fe['vol_loop_count'] -= 1
+                            if fe['vol_loop_count'] > 0:
+                                try:
+                                    back = rom.read_byte(lc_addr + 1)
+                                except (ValueError, IndexError):
+                                    fe['vol_pos'] = 0
+                                    break
+                                fe['vol_pos'] = max(0, pos - back)
+                                continue
+                            else:
+                                fe['vol_pos'] = pos + 3
+                                continue
+                        if count == 0:
+                            fe['vol_active'] = False
+                            break
+                        try:
+                            delta = rom.read_byte(fe['vol_ptr'] + pos + 1)
+                        except (ValueError, IndexError):
+                            fe['vol_active'] = False
+                            break
+                        if delta >= 0x80:
+                            delta -= 0x100
+                        fe['vol_delta'] = delta
+                        fe['vol_frame_ctr'] = count
+                        fe['vol_pos'] = pos + 2
+                        break
+
+                if fe['vol_active']:
+                    fe['vol_accum'] += fe['vol_delta']
+                    fe['vol_accum'] = max(-128, min(127, fe['vol_accum']))
+
+            # Compute effective AUDF and AUDC
+            freq_mid = (fe['freq_accum'] >> 8) & 0xFF
+            if fe['freq_accum'] < 0:
+                freq_mid = ((fe['freq_accum'] >> 8) & 0xFF) | (
+                    0xFF00 if fe['freq_accum'] < -256 else 0)
+                freq_mid = freq_mid & 0xFF
+            eff_audf = (base_audf + freq_mid) & 0xFF
+
+            # Volume: accumulator >> 3, add base, clamp 0-15
+            vol_shifted = fe['vol_accum'] >> 3
+            eff_vol = vol_shifted + base_vol
+            eff_vol = max(0, min(15, eff_vol))
+            eff_audc = eff_vol | (distortion & 0xF0)
+
+            frame_time = (start_frame + frame) / 120.0
+            events.append((frame_time, 'pokey_note_on',
+                           (pokey_ch_idx, eff_audf, eff_audc)))
+            actual_frames += 1
+
+            if stop_on_silence:
+                if eff_vol == 0:
+                    silent_frames += 1
+                    if silent_frames >= MAX_SILENT:
+                        break
+                else:
+                    silent_frames = 0
+
+        return actual_frames
+
+    def _calc_envelope_duration(self, ptr, entry_size):
+        """Calculate total frames in an envelope (freq=3 byte, vol=2 byte)."""
+        total = 0
+        pos = 0
+        for _ in range(200):
+            try:
+                count = self.rom.read_byte(ptr + pos)
+            except (ValueError, IndexError):
+                break
+            if count == 0xFF or count == 0:
+                break
+            total += count
+            pos += entry_size
+        return total
 
     def _interpret_sequence(self, start_addr, channel_id, hw_mode,
                             max_seconds):
@@ -1384,11 +1939,22 @@ class SequenceInterpreter:
         variables = [0] * 8
         var_reg = 0
 
+        # POKEY envelope state (persists across notes)
+        # freq_active/vol_active: True when envelope is running
+        pokey_env = {
+            'freq_active': False, 'freq_ptr': 0, 'freq_pos': 0,
+            'freq_frame_ctr': 0, 'freq_delta': 0, 'freq_accum': 0,
+            'freq_loop_count': -1,
+            'vol_active': False, 'vol_ptr': 0, 'vol_pos': 0,
+            'vol_frame_ctr': 0, 'vol_delta': 0, 'vol_accum': 0,
+            'vol_loop_count': -1,
+        }
+
         cumulative_frames = 0.0
         max_frames = max_seconds * 120.0
         max_instructions = 50000
 
-        pokey_ch_idx = max(0, (channel_id - 8)) if channel_id >= 8 else 0
+        pokey_ch_idx = channel_id & 0x03
 
         for _ in range(max_instructions):
             if cumulative_frames > max_frames:
@@ -1446,18 +2012,29 @@ class SequenceInterpreter:
                         freq_word = self.rom.read_word(
                             self.FREQ_TABLE_ADDR + effective_note * 2)
                         freq_word = (freq_word + freq_offset) & 0xFFFF
+                        base_audf = freq_word & 0xFF
 
-                        # Compute AUDF divider
-                        if freq_word > 0:
-                            audf = freq_word & 0xFF
+                        has_env = (pokey_env['freq_active'] or
+                                   pokey_env['vol_active'])
+                        if has_env:
+                            # Envelope-driven: emit per-frame events
+                            note_frames = max(1, int(dur_frames))
+                            self._step_pokey_envelopes(
+                                pokey_env, base_audf, volume,
+                                distortion, pokey_ch_idx,
+                                cumulative_frames, note_frames, events)
+                            end_t = (cumulative_frames + note_frames) / 120.0
+                            if not sustain:
+                                events.append((end_t, 'pokey_note_off',
+                                               (pokey_ch_idx,)))
                         else:
-                            audf = 0
-
-                        audc = (volume & 0x0F) | (distortion & 0xF0)
-                        events.append((time_secs, 'pokey_note_on',
-                                       (pokey_ch_idx, audf, audc)))
-                        events.append((time_secs + dur_secs, 'pokey_note_off',
-                                       (pokey_ch_idx,)))
+                            audc = (volume & 0x0F) | (distortion & 0xF0)
+                            events.append((time_secs, 'pokey_note_on',
+                                           (pokey_ch_idx, base_audf, audc)))
+                            if not sustain:
+                                events.append((time_secs + dur_secs,
+                                               'pokey_note_off',
+                                               (pokey_ch_idx,)))
 
                     elif hw_mode == "YM2151" and self.ym2151:
                         # Convert note to YM2151 key code
@@ -1478,10 +2055,30 @@ class SequenceInterpreter:
                             events.append((time_secs + dur_secs,
                                            'ym_note_off', (channel_id,)))
                 else:
-                    # Rest - just silence
+                    # Rest
                     if hw_mode == "POKEY" and self.pokey:
-                        events.append((time_secs, 'pokey_note_off',
-                                       (pokey_ch_idx,)))
+                        has_env = (pokey_env['freq_active'] or
+                                   pokey_env['vol_active'])
+                        if has_env:
+                            # Envelope-driven REST: keep envelopes running
+                            note_frames = max(1, int(dur_frames))
+                            use_silence_stop = dur_frames < 1
+                            if use_silence_stop:
+                                # No tempo / zero duration: run envelopes
+                                # until volume goes silent (max 5s safety)
+                                note_frames = 600
+                            base_audf = 0
+                            actual = self._step_pokey_envelopes(
+                                pokey_env, base_audf, volume,
+                                distortion, pokey_ch_idx,
+                                cumulative_frames, note_frames, events,
+                                stop_on_silence=use_silence_stop)
+                            dur_frames = max(dur_frames,
+                                             actual if use_silence_stop
+                                             else note_frames)
+                        else:
+                            events.append((time_secs, 'pokey_note_off',
+                                           (pokey_ch_idx,)))
 
                 cumulative_frames += dur_frames
                 pc += 2
@@ -1516,16 +2113,38 @@ class SequenceInterpreter:
                 transpose = (transpose + val) & 0x7F
             elif byte0 == 0x86 and len(args) >= 2:  # SET_FREQ_ENV
                 freq_env_ptr = args[0] | (args[1] << 8)
+                pokey_env['freq_active'] = True
+                pokey_env['freq_ptr'] = freq_env_ptr
+                pokey_env['freq_pos'] = 0
+                pokey_env['freq_frame_ctr'] = 1  # trigger advance on 1st frame
+                pokey_env['freq_delta'] = 0
+                pokey_env['freq_accum'] = 0
+                pokey_env['freq_loop_count'] = -1
             elif byte0 == 0x87 and len(args) >= 2:  # SET_VOL_ENV
                 vol_env_ptr = args[0] | (args[1] << 8)
+                pokey_env['vol_active'] = True
+                pokey_env['vol_ptr'] = vol_env_ptr
+                pokey_env['vol_pos'] = 0
+                pokey_env['vol_frame_ctr'] = 1  # trigger advance on 1st frame
+                pokey_env['vol_delta'] = 0
+                pokey_env['vol_accum'] = 0
+                pokey_env['vol_loop_count'] = -1
             elif byte0 == 0x89 and args:     # SET_REPEAT
                 repeat_count = args[0]
             elif byte0 == 0x8A and args:     # SET_DISTORTION
                 distortion = args[0]
             elif byte0 == 0x8B and args:     # SET_CTRL_BITS
                 ctrl_bits |= args[0]
+                if hw_mode == "POKEY":
+                    time_secs = cumulative_frames / 120.0
+                    events.append((time_secs, 'pokey_audctl',
+                                   (ctrl_bits & 0xFF,)))
             elif byte0 == 0x8C and args:     # CLR_CTRL_BITS
                 ctrl_bits &= ~args[0]
+                if hw_mode == "POKEY":
+                    time_secs = cumulative_frames / 120.0
+                    events.append((time_secs, 'pokey_audctl',
+                                   (ctrl_bits & 0xFF,)))
             elif byte0 == 0x8D and len(args) >= 2:  # PUSH_SEQ
                 target = args[0] | (args[1] << 8)
                 ret = pc + 3
@@ -1557,7 +2176,11 @@ class SequenceInterpreter:
                 hw_mode = "YM2151"
             elif byte0 == 0x97:              # RESET_ENVELOPE
                 freq_env_ptr = 0
+                pokey_env['freq_active'] = False
+                pokey_env['freq_accum'] = 0
                 vol_env_ptr = 0
+                pokey_env['vol_active'] = False
+                pokey_env['vol_accum'] = 0
             elif byte0 == 0x99 and len(args) >= 2:  # SET_SEQ_PTR (jump)
                 target = args[0] | (args[1] << 8)
                 if ROM_BASE <= target <= ROM_END:
@@ -1679,9 +2302,9 @@ class SequenceInterpreter:
         return writes
 
     def _render_pokey_events(self, events, max_seconds, sample_rate):
-        """Render POKEY events to mono PCM samples."""
+        """Render POKEY events to mono PCM numpy array."""
         if not self.pokey or not events:
-            return []
+            return np.array([], dtype=np.int16)
 
         events.sort(key=lambda e: e[0])
         total_samples = int(max_seconds * sample_rate)
@@ -1696,64 +2319,65 @@ class SequenceInterpreter:
         end_time = min(end_time + 0.1, max_seconds)  # small tail
 
         if end_time <= 0:
-            return []
+            return np.array([], dtype=np.int16)
 
         total_samples = int(end_time * sample_rate)
         if total_samples <= 0:
-            return []
+            return np.array([], dtype=np.int16)
 
         # Process events in time order, rendering between them
         self.pokey.reset()
         self.pokey.SKCTL = 0x03  # ensure not in reset
 
-        samples = []
+        chunks = []
         current_sample = 0
         event_idx = 0
 
         while current_sample < total_samples and event_idx <= len(events):
-            # Find next event time
             if event_idx < len(events):
                 next_time = events[event_idx][0]
                 next_sample = min(int(next_time * sample_rate), total_samples)
             else:
                 next_sample = total_samples
 
-            # Render up to next event
             render_count = next_sample - current_sample
             if render_count > 0:
                 chunk = self.pokey.render(render_count, sample_rate)
-                samples.extend(chunk)
+                chunks.append(chunk)
                 current_sample += render_count
 
-            # Apply events at this time
             while (event_idx < len(events) and
                    int(events[event_idx][0] * sample_rate) <= current_sample):
                 t, etype, data = events[event_idx]
                 if etype == 'pokey_note_on':
                     ch_idx, audf, audc = data
                     ch_idx = ch_idx % 4
-                    self.pokey.write(ch_idx * 2, audf)      # AUDFn
-                    self.pokey.write(ch_idx * 2 + 1, audc)  # AUDCn
+                    self.pokey.write(ch_idx * 2, audf)
+                    self.pokey.write(ch_idx * 2 + 1, audc)
                 elif etype == 'pokey_note_off':
                     ch_idx = data[0] % 4
-                    self.pokey.write(ch_idx * 2 + 1, 0)     # silence
+                    self.pokey.write(ch_idx * 2 + 1, 0)
+                elif etype == 'pokey_audctl':
+                    self.pokey.write(0x08, data[0])
                 event_idx += 1
 
             if event_idx >= len(events):
-                # Render remaining
                 remain = total_samples - current_sample
                 if remain > 0:
                     chunk = self.pokey.render(remain, sample_rate)
-                    samples.extend(chunk)
+                    chunks.append(chunk)
                     current_sample += remain
                 break
 
-        return samples[:total_samples]
+        if chunks:
+            samples = np.concatenate(chunks)
+            return samples[:total_samples]
+        return np.array([], dtype=np.int16)
 
     def _render_ym_events(self, events, max_seconds, sample_rate):
-        """Render YM2151 events to stereo PCM samples."""
+        """Render YM2151 events to stereo PCM numpy array (N,2)."""
         if not self.ym2151 or not events:
-            return []
+            return np.zeros((0, 2), dtype=np.int16)
 
         events.sort(key=lambda e: e[0])
 
@@ -1766,14 +2390,14 @@ class SequenceInterpreter:
         end_time = min(end_time + 0.5, max_seconds)
 
         if end_time <= 0:
-            return []
+            return np.zeros((0, 2), dtype=np.int16)
 
         total_samples = int(end_time * sample_rate)
         if total_samples <= 0:
-            return []
+            return np.zeros((0, 2), dtype=np.int16)
 
         self.ym2151.reset()
-        samples = []
+        chunks = []
         current_sample = 0
         event_idx = 0
 
@@ -1787,7 +2411,7 @@ class SequenceInterpreter:
             render_count = next_sample - current_sample
             if render_count > 0:
                 chunk = self.ym2151.render(render_count, sample_rate)
-                samples.extend(chunk)
+                chunks.append(chunk)
                 current_sample += render_count
 
             while (event_idx < len(events) and
@@ -1800,22 +2424,24 @@ class SequenceInterpreter:
                     ch, kc, vol = data
                     ch = ch & 0x07
                     self.ym2151.write(0x28 + ch, kc)
-                    # Key on all 4 slots
                     self.ym2151.write(0x08, 0x78 | ch)
                 elif etype == 'ym_note_off':
                     ch = data[0] & 0x07
-                    self.ym2151.write(0x08, ch)  # all slots off
+                    self.ym2151.write(0x08, ch)
                 event_idx += 1
 
             if event_idx >= len(events):
                 remain = total_samples - current_sample
                 if remain > 0:
                     chunk = self.ym2151.render(remain, sample_rate)
-                    samples.extend(chunk)
+                    chunks.append(chunk)
                     current_sample += remain
                 break
 
-        return samples[:total_samples]
+        if chunks:
+            samples = np.concatenate(chunks, axis=0)
+            return samples[:total_samples]
+        return np.zeros((0, 2), dtype=np.int16)
 
 
 class TimedEvent:
@@ -2818,29 +3444,45 @@ def speech_all_to_wav(rom, names, out_dir):
 # ── Audio Normalization ─────────────────────────────────────────────────────
 
 def _normalize_mono(samples, target_peak=0.9):
-    """Normalize mono int16 samples to target peak level (0.0-1.0)."""
-    if not samples:
-        return samples
-    peak = max(abs(s) for s in samples)
+    """Normalize mono int16 samples to target peak level (0.0-1.0).
+
+    Accepts numpy array (N,) or list of int16. Returns numpy array.
+    """
+    if isinstance(samples, np.ndarray):
+        if samples.size == 0:
+            return samples
+        arr = samples.astype(np.float64)
+    else:
+        if not samples:
+            return np.array([], dtype=np.int16)
+        arr = np.array(samples, dtype=np.float64)
+    peak = np.max(np.abs(arr))
     if peak == 0:
-        return samples
-    target = int(32767 * target_peak)
+        return arr.astype(np.int16)
+    target = 32767 * target_peak
     scale = target / peak
-    return [max(-32768, min(32767, int(s * scale))) for s in samples]
+    return np.clip(arr * scale, -32768, 32767).astype(np.int16)
 
 
 def _normalize_stereo(samples, target_peak=0.9):
-    """Normalize stereo (L,R) int16 samples to target peak level."""
-    if not samples:
-        return samples
-    peak = max(max(abs(s[0]), abs(s[1])) for s in samples)
+    """Normalize stereo int16 samples to target peak level.
+
+    Accepts numpy array (N,2) or list of (L,R) tuples. Returns numpy array (N,2).
+    """
+    if isinstance(samples, np.ndarray):
+        if samples.size == 0:
+            return samples
+        arr = samples.astype(np.float64)
+    else:
+        if not samples:
+            return np.array([], dtype=np.int16).reshape(0, 2)
+        arr = np.array(samples, dtype=np.float64)
+    peak = np.max(np.abs(arr))
     if peak == 0:
-        return samples
-    target = int(32767 * target_peak)
+        return arr.astype(np.int16)
+    target = 32767 * target_peak
     scale = target / peak
-    return [(max(-32768, min(32767, int(l * scale))),
-             max(-32768, min(32767, int(r * scale))))
-            for l, r in samples]
+    return np.clip(arr * scale, -32768, 32767).astype(np.int16)
 
 
 # ── POKEY SFX WAV Export ────────────────────────────────────────────────────
@@ -2862,9 +3504,9 @@ def sfx_to_wav(rom, cmd, names, out_path, sample_rate=44100):
         print(f"Command 0x{cmd:02X}: no channel data")
         return
 
-    # Filter to POKEY channels (channel_id >= 0x08)
-    pokey_channels = [ch for ch in channels if ch.channel >= 0x08]
-    ym_channels = [ch for ch in channels if ch.channel < 0x08]
+    # Filter to POKEY channels (0x00-0x03) vs YM2151 channels (0x04-0x0B)
+    pokey_channels = [ch for ch in channels if ch.channel <= 0x03]
+    ym_channels = [ch for ch in channels if ch.channel >= 0x04]
 
     all_samples = []
     hw_desc = []
@@ -2877,64 +3519,124 @@ def sfx_to_wav(rom, cmd, names, out_path, sample_rate=44100):
               f"(seq @ ${ch.seq_ptr:04X})...", flush=True)
         samples = interp.execute_to_audio(ch.seq_ptr, ch.channel,
                                           sample_rate=sample_rate)
-        if samples:
+        if isinstance(samples, np.ndarray) and samples.size > 0:
             all_samples.append(('mono', samples))
             hw_desc.append(f"POKEY ch0x{ch.channel:02X}")
+        elif not isinstance(samples, np.ndarray) and samples:
+            all_samples.append(('mono', np.array(samples, dtype=np.int16)))
+            hw_desc.append(f"POKEY ch0x{ch.channel:02X}")
 
-    # Render YM2151 channels
+    # Render YM2151 channels using event-driven approach (much faster:
+    # collects timed events from all channels, then does a single interleaved
+    # render pass instead of rendering each channel independently).
     if ym_channels:
         ym = YM2151Emulator()
+        all_events = []
         for ch in ym_channels:
             interp = SequenceInterpreter(rom, ym2151=ym)
-            print(f"  Rendering YM2151 channel 0x{ch.channel:02X} "
+            print(f"  Interpreting YM2151 channel 0x{ch.channel:02X} "
                   f"(seq @ ${ch.seq_ptr:04X})...", flush=True)
-            samples = interp.execute_to_audio(ch.seq_ptr, ch.channel,
-                                              sample_rate=sample_rate)
-            if samples:
-                all_samples.append(('stereo', samples))
-                hw_desc.append(f"YM2151 ch0x{ch.channel:02X}")
+            events = interp._interpret_sequence(ch.seq_ptr, ch.channel,
+                                                "YM2151", max_seconds=300.0)
+            all_events.extend(events)
+            hw_desc.append(f"YM2151 ch0x{ch.channel:02X}")
+
+        if all_events:
+            all_events.sort(key=lambda e: e[0])
+            end_time = 0
+            for t, etype, data in all_events:
+                if t > end_time:
+                    end_time = t
+            end_time = min(end_time + 0.5, 300.0)
+            total_ym_samples = int(end_time * sample_rate)
+
+            if total_ym_samples > 0:
+                ym.reset()
+                chunks = []
+                current_sample = 0
+                event_idx = 0
+
+                while current_sample < total_ym_samples:
+                    if event_idx < len(all_events):
+                        next_time = all_events[event_idx][0]
+                        next_sample = min(int(next_time * sample_rate),
+                                          total_ym_samples)
+                    else:
+                        next_sample = total_ym_samples
+
+                    render_count = next_sample - current_sample
+                    if render_count > 0:
+                        chunks.append(ym.render(render_count, sample_rate))
+                        current_sample += render_count
+
+                    while (event_idx < len(all_events) and
+                           int(all_events[event_idx][0] * sample_rate)
+                           <= current_sample):
+                        t, etype, data = all_events[event_idx]
+                        if etype == 'ym_reg_write':
+                            reg, val = data
+                            ym.write(reg, val)
+                        elif etype == 'ym_note_on':
+                            ch_id, kc, vol = data
+                            ch_id = ch_id & 0x07
+                            ym.write(0x28 + ch_id, kc)
+                            ym.write(0x08, 0x78 | ch_id)
+                        elif etype == 'ym_note_off':
+                            ch_id = data[0] & 0x07
+                            ym.write(0x08, ch_id)
+                        event_idx += 1
+
+                    if event_idx >= len(all_events):
+                        remain = total_ym_samples - current_sample
+                        if remain > 0:
+                            chunks.append(ym.render(remain, sample_rate))
+                            current_sample += remain
+                        break
+
+                if chunks:
+                    ym_audio = np.concatenate(chunks, axis=0)
+                    all_samples.append(('stereo', ym_audio))
 
     if not all_samples:
         print(f"Command 0x{cmd:02X}: rendering produced no audio")
         return
 
-    # Mix all channels using float accumulation to avoid clipping.
-    # Scale each chip group (POKEY vs YM2151) to contribute equally,
-    # then normalize the final mix.
+    # Mix all channels using numpy float accumulation to avoid clipping.
     has_stereo = any(t == 'stereo' for t, _ in all_samples)
     max_len = max(len(s) for _, s in all_samples)
 
     # Accumulate in float — separate POKEY and YM groups
-    pokey_l = [0.0] * max_len
-    pokey_r = [0.0] * max_len
-    ym_l = [0.0] * max_len
-    ym_r = [0.0] * max_len
+    pokey_l = np.zeros(max_len, dtype=np.float64)
+    pokey_r = np.zeros(max_len, dtype=np.float64)
+    ym_l = np.zeros(max_len, dtype=np.float64)
+    ym_r = np.zeros(max_len, dtype=np.float64)
     n_pokey = 0
     n_ym = 0
 
     for stype, sdata in all_samples:
+        slen = len(sdata)
         if stype == 'stereo':
             n_ym += 1
-            for i in range(len(sdata)):
-                ym_l[i] += sdata[i][0]
-                ym_r[i] += sdata[i][1]
+            # sdata is (N,2) numpy array
+            if sdata.ndim == 2:
+                ym_l[:slen] += sdata[:, 0].astype(np.float64)
+                ym_r[:slen] += sdata[:, 1].astype(np.float64)
+            else:
+                ym_l[:slen] += sdata.astype(np.float64)
+                ym_r[:slen] += sdata.astype(np.float64)
         else:
             n_pokey += 1
-            for i in range(len(sdata)):
-                pokey_l[i] += sdata[i]
-                pokey_r[i] += sdata[i]
+            # sdata is (N,) numpy array
+            mono = sdata.astype(np.float64) if sdata.ndim == 1 else sdata[:, 0].astype(np.float64)
+            pokey_l[:slen] += mono
+            pokey_r[:slen] += mono
 
     # Find peak of each group
-    pokey_peak = max(max(abs(pokey_l[i]), abs(pokey_r[i]))
-                     for i in range(max_len)) if n_pokey else 0
-    ym_peak = max(max(abs(ym_l[i]), abs(ym_r[i]))
-                  for i in range(max_len)) if n_ym else 0
+    pokey_peak = max(np.max(np.abs(pokey_l)), np.max(np.abs(pokey_r))) if n_pokey else 0
+    ym_peak = max(np.max(np.abs(ym_l)), np.max(np.abs(ym_r))) if n_ym else 0
 
     # Scale each group so its peak fits in roughly half of int16 range.
-    # This ensures neither chip dominates the other in the mix.
-    # When only one chip is present, it gets the full range.
     if n_pokey > 0 and n_ym > 0:
-        # Both present: give each half the headroom
         target = 16000.0
         pk_scale = (target / pokey_peak) if pokey_peak > 0 else 0.0
         ym_scale = (target / ym_peak) if ym_peak > 0 else 0.0
@@ -2945,36 +3647,29 @@ def sfx_to_wav(rom, cmd, names, out_path, sample_rate=44100):
         pk_scale = 0.0
         ym_scale = (29000.0 / ym_peak) if ym_peak > 0 else 0.0
 
-    # Final mix
+    # Final mix (vectorized)
     if has_stereo:
-        mixed = []
-        for i in range(max_len):
-            l = pokey_l[i] * pk_scale + ym_l[i] * ym_scale
-            r = pokey_r[i] * pk_scale + ym_r[i] * ym_scale
-            mixed.append((max(-32768, min(32767, int(l))),
-                          max(-32768, min(32767, int(r)))))
+        mix_l = np.clip(pokey_l * pk_scale + ym_l * ym_scale,
+                        -32768, 32767).astype(np.int16)
+        mix_r = np.clip(pokey_r * pk_scale + ym_r * ym_scale,
+                        -32768, 32767).astype(np.int16)
+        mixed = np.column_stack((mix_l, mix_r))
 
         with wave.open(out_path, 'w') as wf:
             wf.setnchannels(2)
             wf.setsampwidth(2)
             wf.setframerate(sample_rate)
-            pcm = b''
-            for l, r in mixed:
-                pcm += struct.pack('<hh', l, r)
-            wf.writeframes(pcm)
+            wf.writeframes(mixed.tobytes())
         n_samples = len(mixed)
     else:
-        mixed = []
-        for i in range(max_len):
-            s = pokey_l[i] * pk_scale + ym_l[i] * ym_scale
-            mixed.append(max(-32768, min(32767, int(s))))
+        mixed = np.clip(pokey_l * pk_scale + ym_l * ym_scale,
+                        -32768, 32767).astype(np.int16)
 
         with wave.open(out_path, 'w') as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
             wf.setframerate(sample_rate)
-            pcm = struct.pack(f'<{len(mixed)}h', *mixed)
-            wf.writeframes(pcm)
+            wf.writeframes(mixed.tobytes())
         n_samples = len(mixed)
 
     duration = n_samples / sample_rate
@@ -2987,7 +3682,7 @@ def sfx_to_wav(rom, cmd, names, out_path, sample_rate=44100):
 
 
 def sfx_all_to_wav(rom, names, out_dir, sample_rate=44100):
-    """Render all POKEY SFX commands to WAV files in a directory."""
+    """Render all type 7 SFX commands (POKEY + YM2151) to WAV files."""
     os.makedirs(out_dir, exist_ok=True)
 
     count = 0
@@ -2997,10 +3692,6 @@ def sfx_all_to_wav(rom, names, out_dir, sample_rate=44100):
             continue
         channels = info.channels or []
         if not channels:
-            continue
-        # Check if any channel is POKEY
-        has_pokey = any(ch.channel >= 0x08 for ch in channels)
-        if not has_pokey:
             continue
 
         name_info = names.get(cmd)
@@ -3042,7 +3733,7 @@ def music_to_wav(rom, cmd, names, out_path, sample_rate=44100):
         print(f"Command 0x{cmd:02X}: no channel data")
         return
 
-    ym_channels = [ch for ch in channels if ch.channel < 0x08]
+    ym_channels = [ch for ch in channels if ch.channel >= 0x04]
     if not ym_channels:
         print(f"Command 0x{cmd:02X}: no YM2151 channels (POKEY SFX only)")
         return
@@ -3081,7 +3772,7 @@ def music_to_wav(rom, cmd, names, out_path, sample_rate=44100):
           flush=True)
 
     ym.reset()
-    samples = []
+    chunks = []
     current_sample = 0
     event_idx = 0
 
@@ -3096,7 +3787,7 @@ def music_to_wav(rom, cmd, names, out_path, sample_rate=44100):
         render_count = next_sample - current_sample
         if render_count > 0:
             chunk = ym.render(render_count, sample_rate)
-            samples.extend(chunk)
+            chunks.append(chunk)
             current_sample += render_count
 
         # Apply events
@@ -3120,9 +3811,15 @@ def music_to_wav(rom, cmd, names, out_path, sample_rate=44100):
             remain = total_samples - current_sample
             if remain > 0:
                 chunk = ym.render(remain, sample_rate)
-                samples.extend(chunk)
+                chunks.append(chunk)
                 current_sample += remain
             break
+
+    # Concatenate all chunks into single numpy array
+    if chunks:
+        samples = np.concatenate(chunks, axis=0)
+    else:
+        samples = np.zeros((0, 2), dtype=np.int16)
 
     # Normalize and write stereo WAV
     samples = _normalize_stereo(samples)
@@ -3130,10 +3827,7 @@ def music_to_wav(rom, cmd, names, out_path, sample_rate=44100):
         wf.setnchannels(2)
         wf.setsampwidth(2)
         wf.setframerate(sample_rate)
-        pcm = b''
-        for l, r in samples:
-            pcm += struct.pack('<hh', l, r)
-        wf.writeframes(pcm)
+        wf.writeframes(samples.tobytes())
 
     duration = len(samples) / sample_rate
     name_info = names.get(cmd)
@@ -3156,7 +3850,7 @@ def music_all_to_wav(rom, names, out_dir, sample_rate=44100):
         channels = info.channels or []
         if not channels:
             continue
-        has_ym = any(ch.channel < 0x08 for ch in channels)
+        has_ym = any(ch.channel >= 0x04 for ch in channels)
         if not has_ym:
             continue
 
@@ -3198,8 +3892,8 @@ def render_wav(rom, cmd, names, out_path, sample_rate=44100):
         return
 
     channels = info.channels or []
-    has_ym = any(ch.channel < 0x08 for ch in channels)
-    has_pokey = any(ch.channel >= 0x08 for ch in channels)
+    has_ym = any(ch.channel >= 0x04 for ch in channels)
+    has_pokey = any(ch.channel <= 0x03 for ch in channels)
 
     if has_ym and not has_pokey:
         music_to_wav(rom, cmd, names, out_path, sample_rate)

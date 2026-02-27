@@ -58,7 +58,7 @@ RESET → Initialize → Main Loop ──┐
           │ Read Cmd Buffer  │      │  IRQ (240Hz)     │
           │ cmd_dispatch     │      │   - POKEY (120Hz)│
           │  → Handlers      │      │   - YM2151(120Hz)│
-          │    - POKEY SFX   │      │   - TMS5220(240) │
+          │    - Type 7 SFX  │      │   - TMS5220(240) │
           │    - YM2151 Mus  │      │                  │
           │    - TMS5220 Spc │      │  NMI (events)    │
           │    - Control     │      │   - Read 0x1010  │
@@ -211,7 +211,7 @@ RESET → Initialize → Main Loop ──┐
 | 0x4374 | **handler_kill_by_status** | Kill channels by status pattern match (never dispatched) |
 | 0x438D | **handler_stop_sound** | Stop specific named sound (0x21, 0x2F, 0x39) |
 | 0x43AF | **handler_stop_chain** | Stop channel chain by group (never dispatched) |
-| 0x44DE | **handler_type_7** | **Main POKEY SFX** (~90 commands, priority system) |
+| 0x44DE | **handler_type_7** | **Main SFX handler** (~90 commands, POKEY + YM2151, priority system) |
 | 0x4445 | **handler_type_8** | Queue commands to main CPU output buffer |
 | 0x43D4 | **handler_fadeout_sound** | Fade out specific sound (0x3C "Theme Fade Out") |
 | 0x440B | **handler_fadeout_by_status** | Fade out by status match (0x41 "Treasure Fade Out") |
@@ -415,7 +415,7 @@ Return to main_loop
 | 0 | handler_type_0 (param shift) | 2 | 0x01-0x02 |
 | 3 | handler_type_3 (jump dispatch) | 1 | 0x00 |
 | 5 | handler_stop_sound | 3 | 0x21, 0x2F, 0x39 |
-| 7 | handler_type_7 (POKEY SFX) | 90 | 0x04-0x05, 0x09-0x20, 0x22-0x2E, 0x30-0x3B, 0x3D-0x40, 0x42-0x49 |
+| 7 | handler_type_7 (SFX/Music) | 90 | 0x04-0x05, 0x09-0x20, 0x22-0x2E, 0x30-0x3B, 0x3D-0x40, 0x42-0x49 |
 | 8 | handler_type_8 (output queue) | 1 | 0xDA |
 | 9 | handler_fadeout_sound | 1 | 0x3C |
 | 10 | handler_fadeout_by_status | 1 | 0x41 |
@@ -428,12 +428,12 @@ Return to main_loop
 
 ---
 
-### 3. POKEY Sound Effects System
+### 3. Sound Effects System (Type 7 Handler)
 
-**Architecture**: 30 logical channels → 4 physical POKEY channels
+**Architecture**: 30 logical channels → 4 POKEY channels + 8 YM2151 channels
 
 ```
-POKEY SFX Command (e.g., 0x0D "Food Eaten")
+Type 7 SFX Command (e.g., 0x0D "Food Eaten")
     ↓
 ┌──────────────────────────────────────────┐
 │ handler_type_7 (0x44DE)               │
@@ -497,7 +497,7 @@ POKEY SFX Command (e.g., 0x0D "Food Eaten")
 
 **Channel Allocation**:
 - 30 logical channels managed
-- Dynamically mapped to 4 POKEY channels
+- Dynamically mapped to 4 POKEY + 8 YM2151 channels
 - Table 0x60DA assigns physical channel
 - Multiple logical → same physical possible
 
@@ -856,14 +856,14 @@ Offset 3,5:  18 02 → 0x0218 RAM buffer
 | **0x5D0F** | NMI Validation Table | 219 B | 1B/cmd | Command validation (FF=invalid, 0-2=dispatch) |
 | **0x5FA2** | NMI Dispatch Table | 6 B | 16-bit LE | NMI immediate dispatch (3 handlers) |
 
-### POKEY SFX Tables
+### Type 7 SFX Tables (POKEY + YM2151)
 
 | Address | Name | Size | Format | Purpose |
 |---------|------|------|--------|---------|
 | **0x5FA8** | SFX Data Offset | ~200 B | 1B/sound | Index into data pointer tables |
 | **0x5FE6** | SFX Flags | ~200 B | 1B/sound | Behavior flags (FF=immediate, 00=dup check) |
 | **0x6024** | SFX Priority | ~200 B | 1B/sound | Interrupt priority (00=low, 0F=high) |
-| **0x60DA** | SFX Channel Map | ~200 B | 1B/sound | POKEY channel assignment (04-0B) |
+| **0x60DA** | SFX Channel Map | ~200 B | 1B/sound | Hardware channel assignment (00-03=POKEY, 04-0B=YM2151) |
 | **0x6190** | SFX Data Pointers A | ~400 B | 16-bit LE | Primary sound sequence pointers |
 | **0x6290** | SFX Data Pointers B | ~400 B | 16-bit LE | Alternate sound sequences |
 | **0x62FC** | SFX Next-Offset Chain | ~180 B | 1B/offset | Multi-channel chaining (0=end) |
@@ -891,7 +891,7 @@ Offset 3,5:  18 02 → 0x0218 RAM buffer
 | **0x5AF9** | YM2151 Operator Params | ~64 B | 1B/entry | Noise/LFO settings for operators |
 
 **Music Sequence Data**: Located at 0x8700-0xAD00 (~10KB)
-- Same 2-byte frame format as POKEY SFX (shared bytecode engine!)
+- Same 2-byte frame format as type 7 SFX (shared bytecode engine!)
 - Uses same 59-opcode instruction set
 - Additional YM2151-specific opcodes: SET_VOICE (0x9D), YM_WRITE_REGS (0xB4), YM_SET_ALGO (0xB6)
 - FM operator configs, note frequencies via 128-entry table at 0x5A35
@@ -1061,7 +1061,7 @@ All 15 handler types fully documented:
 | 4 | 0x4374 | handler_kill_by_status | None | Reserved |
 | 5 | 0x438D | handler_stop_sound | 0x21, 0x2F, 0x39 | Active |
 | 6 | 0x43AF | handler_stop_chain | None | Reserved |
-| 7 | 0x44DE | handler_type_7 | ~90 POKEY SFX | Active |
+| 7 | 0x44DE | handler_type_7 | ~90 SFX (POKEY + YM2151) | Active |
 | 8 | 0x4445 | handler_type_8 | 0xDA | Active |
 | 9 | 0x43D4 | handler_fadeout_sound | 0x3C | Active |
 | 10 | 0x440B | handler_fadeout_by_status | 0x41 | Active |
@@ -1311,9 +1311,8 @@ Byte 1 (Duration/Envelope) — only when byte 0 is a note:
 
 **219 Total Commands**:
 - **0x00-0x03**: System (stop, silent, noisy)
-- **0x04-0x2F**: POKEY SFX (44 effects)
-- **0x30-0x42**: YM2151 Music (19 tracks)
-- **0x43-0x49**: More SFX (7 effects)
+- **0x04-0x42**: Type 7 SFX/Music (63 effects — mostly YM2151; only 0x05, 0x43-0x49 use POKEY)
+- **0x43-0x49**: POKEY weapon SFX (7 effects)
 - **0x4A-0xD5**: TMS5220 Speech (140 phrases)
 
 **To Add New Sound**:
@@ -1325,12 +1324,12 @@ Byte 1 (Duration/Envelope) — only when byte 0 is a note:
 
 #### Sound Design Guidelines
 
-**POKEY SFX**:
-- 4 channels available
-- 8-bit frequency + 4-bit volume + distortion
+**Type 7 SFX (shared bytecode interpreter)**:
+- Channels 0x00-0x03: POKEY (8-bit freq + 4-bit vol + distortion; freq/vol envelopes)
+- Channels 0x04-0x0B: YM2151 FM synthesis (4 ops/ch, voice patches via SET_VOICE)
 - Priority 0x00-0x0F (higher = less interruptible)
-- Duration controlled by sequence length
 - Multi-channel effects via $62FC chain table (e.g., heartbeat=2ch, theme song=8ch)
+- Only 8 commands use POKEY (0x05, 0x43-0x49); all others use YM2151
 
 **YM2151 Music**:
 - 8 channels FM synthesis
